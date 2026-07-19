@@ -23,7 +23,7 @@ def inspect_vector_database():
     print(f"\n🔍 Searching for matches to: '{query}'...\n")
     
     # 🌌 3. Perform a similarity search that returns both documents and scores
-    results = vectorstore.similarity_search_with_score(query, k=3)
+    results = vectorstore.similarity_search_with_score(query, k=10)
     
     # 📋 4. Print out the text and the raw mathematical distance
     for i, (doc, score) in enumerate(results, start=1):
