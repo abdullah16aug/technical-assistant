@@ -1,0 +1,262 @@
+=========================================================================================
+Microsoft Teams Chat History
+Team: GCP Data Engineering
+=========================================================================================
+
+[2026-07-18 09:00:00] [aman]:
+Good morning everyone!
+
+[2026-07-18 09:01:00] [priya]:
+Morning!
+
+[2026-07-18 09:10:00] [rahul]:
+Our Airflow DAG failed overnight. The task is stuck in retry state.
+
+[2026-07-18 09:12:00] [priya]:
+What's the error in the logs?
+
+[2026-07-18 09:14:00] [rahul]:
+"Connection timeout while connecting to Cloud SQL."
+
+[2026-07-18 09:18:00] [aman]:
+Check if the Cloud SQL Proxy is running on the worker.
+
+[2026-07-18 09:22:00] [rahul]:
+It wasn't running.
+
+[2026-07-18 09:24:00] [aman]:
+Restart the proxy service and retry the DAG.
+
+[2026-07-18 09:28:00] [rahul]:
+Done. Pipeline completed successfully.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 10:05:00] [neha]:
+Anyone seeing "Quota Exceeded" while loading data into BigQuery?
+
+[2026-07-18 10:07:00] [vishal]:
+Which API?
+
+[2026-07-18 10:08:00] [neha]:
+BigQuery Storage Write API.
+
+[2026-07-18 10:12:00] [vishal]:
+Looks like we've reached the streaming insert quota.
+
+[2026-07-18 10:15:00] [aman]:
+Batch the records instead of sending individual inserts.
+
+[2026-07-18 10:18:00] [neha]:
+Changed the batch size to 10,000 rows.
+
+[2026-07-18 10:22:00] [neha]:
+Issue resolved.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 11:00:00] [rahul]:
+Spark job on Dataproc keeps failing with OutOfMemoryError.
+
+[2026-07-18 11:02:00] [priya]:
+Driver or executor?
+
+[2026-07-18 11:04:00] [rahul]:
+Executor.
+
+[2026-07-18 11:08:00] [aman]:
+Increase executor memory to 8GB.
+
+Also reduce shuffle partitions.
+
+spark.executor.memory=8g
+spark.sql.shuffle.partitions=200
+
+[2026-07-18 11:15:00] [rahul]:
+Job completed in 18 minutes instead of failing.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 12:00:00] [dev]:
+Pub/Sub subscriber is receiving duplicate messages.
+
+[2026-07-18 12:04:00] [priya]:
+Are you acknowledging the messages?
+
+[2026-07-18 12:06:00] [dev]:
+No.
+
+[2026-07-18 12:08:00] [priya]:
+Ack the message after successful processing.
+
+Otherwise Pub/Sub redelivers it.
+
+[2026-07-18 12:12:00] [dev]:
+Fixed.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 01:00:00] [aman]:
+Dataflow pipeline keeps restarting workers.
+
+[2026-07-18 01:05:00] [rahul]:
+CPU utilization?
+
+[2026-07-18 01:06:00] [aman]:
+Nearly 100%.
+
+[2026-07-18 01:10:00] [rahul]:
+Increase worker machine type.
+
+Also enable autoscaling.
+
+[2026-07-18 01:18:00] [aman]:
+Pipeline stable now.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 02:00:00] [priya]:
+BigQuery query taking 15 minutes.
+
+[2026-07-18 02:02:00] [vishal]:
+Partitioned table?
+
+[2026-07-18 02:04:00] [priya]:
+No.
+
+[2026-07-18 02:05:00] [vishal]:
+Partition on transaction_date.
+
+Cluster on customer_id.
+
+[2026-07-18 02:18:00] [priya]:
+Runtime reduced to 2 minutes.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 03:00:00] [rahul]:
+How do we optimize joins in Spark?
+
+[2026-07-18 03:03:00] [aman]:
+Use Broadcast Join if one table is small.
+
+Example:
+
+broadcast(customer_df)
+
+Avoid shuffle whenever possible.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 03:30:00] [neha]:
+Databricks notebook throws "java.lang.OutOfMemoryError".
+
+[2026-07-18 03:35:00] [rahul]:
+Cache being overused?
+
+[2026-07-18 03:37:00] [neha]:
+Yes.
+
+[2026-07-18 03:40:00] [rahul]:
+Call unpersist() once you're done.
+
+Also avoid caching unnecessary DataFrames.
+
+[2026-07-18 03:45:00] [neha]:
+Working now.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 04:00:00] [dev]:
+GCS upload failed.
+
+Error:
+403 Access Denied.
+
+[2026-07-18 04:02:00] [ops]:
+Does the service account have Storage Object Admin?
+
+[2026-07-18 04:04:00] [dev]:
+Only Viewer role.
+
+[2026-07-18 04:08:00] [ops]:
+Grant Storage Object Creator or Storage Object Admin.
+
+[2026-07-18 04:12:00] [dev]:
+Resolved.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 04:30:00] [aman]:
+Airflow DAG cannot find Python package pandas.
+
+[2026-07-18 04:32:00] [rahul]:
+Composer environment updated?
+
+[2026-07-18 04:34:00] [aman]:
+Forgot to add it.
+
+[2026-07-18 04:36:00] [rahul]:
+Add pandas to requirements.txt and update the Composer environment.
+
+[2026-07-18 04:45:00] [aman]:
+Working.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 05:00:00] [priya]:
+Cloud Function timing out after 60 seconds.
+
+[2026-07-18 05:04:00] [vishal]:
+Long-running task?
+
+[2026-07-18 05:06:00] [priya]:
+Yes.
+
+[2026-07-18 05:08:00] [vishal]:
+Move the processing to Cloud Run or trigger Dataflow.
+
+Cloud Functions are better for lightweight tasks.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 05:40:00] [rahul]:
+How do we optimize BigQuery cost?
+
+[2026-07-18 05:42:00] [aman]:
+Never use SELECT *.
+
+Query only required columns.
+
+Partition large tables.
+
+Use clustered tables.
+
+Avoid unnecessary full table scans.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 06:10:00] [neha]:
+Dataflow pipeline is processing duplicate records.
+
+[2026-07-18 06:12:00] [rahul]:
+Use a unique event_id.
+
+Deduplicate before writing to BigQuery.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 06:40:00] [ops]:
+Reminder:
+Production deployment tonight at 9 PM.
+
+Please stop merging code after 8 PM.
+
+-----------------------------------------------------------------------------------------
+
+[2026-07-18 08:30:00] [ops]:
+Deployment completed successfully.
+
+All pipelines are healthy.
+
+Good job everyone!

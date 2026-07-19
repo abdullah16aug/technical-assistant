@@ -1,3 +1,5 @@
+import os
+import tempfile
 import streamlit as st
 import requests
 import uuid
@@ -67,11 +69,15 @@ elif page == "📂 Update Knowledge Base":
     st.title("📂 Update System Knowledge Base")
     st.markdown("Add new technical materials, structured FAQs, or past team chat logs to the vector database.")
 
+    allowed_md_types = {"Documentation", "FAQs"}
+
     # Form components for ingestion inputs
     with st.form("ingestion_form"):
-        file_path_input = st.text_input(
-            "Enter Local File Path:",
-            placeholder="e.g., data/docs/payment_gateway.md"
+        uploaded_file = st.file_uploader(
+            "Upload a file:",
+            type=None,
+            accept_multiple_files=False,
+            help="Drag and drop a file here, or click to browse. Documentation and FAQ files must be .md."
         )
         
         data_type = st.selectbox(
@@ -82,39 +88,47 @@ elif page == "📂 Update Knowledge Base":
         submit_button = st.form_submit_button(label="🚀 Upload and Ingest")
 
     if submit_button:
-        if not file_path_input.strip():
-            st.warning("Please enter a valid file path before submitting.")
+        if not uploaded_file:
+            st.warning("Please upload a file before submitting.")
         else:
-            # Map the dropdown selection to the corresponding backend URL endpoint
             endpoint_map = {
                 "Documentation": "http://127.0.0.1:8000/ingest/documentation",
                 "FAQs": "http://127.0.0.1:8000/ingest/faq",
                 "Chat History": "http://127.0.0.1:8000/ingest/chats"
             }
-            
             target_url = endpoint_map[data_type]
-            
-            with st.spinner(f"Ingesting into {data_type}..."):
+
+            file_name = uploaded_file.name or "uploaded_file"
+            if data_type in allowed_md_types and not file_name.lower().endswith(".md"):
+                st.error("Documentation and FAQ uploads must be Markdown files ending in .md.")
+            else:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_file_path = tmp_file.name
+
                 try:
-                    response = requests.post(
-                        target_url,
-                        json={"file_path": file_path_input.strip()}
-                    )
-                    response.raise_for_status()
-                    res_data = response.json()
-                    
-                    # Display success metrics
-                    st.success(f"Backend Status: {res_data.get('status').upper()}")
-                    st.info(res_data.get("message"))
-                    
-                    # If chat history was processed, show the curated LLM output summary block
-                    if "extracted_data" in res_data and res_data["extracted_data"]:
-                        st.subheader("🤖 Curated QA Content Extracted by LLM:")
-                        st.code(res_data["extracted_data"], language="markdown")
-                        
+                    with st.spinner(f"Ingesting uploaded {file_name} into {data_type}..."):
+                        response = requests.post(
+                            target_url,
+                            json={"file_path": tmp_file_path}
+                        )
+                        response.raise_for_status()
+                        res_data = response.json()
+
+                        st.success(f"Backend Status: {res_data.get('status').upper()}")
+                        st.info(res_data.get("message"))
+
+                        if "extracted_data" in res_data and res_data["extracted_data"]:
+                            st.subheader("🤖 Curated QA Content Extracted by LLM:")
+                            st.code(res_data["extracted_data"], language="markdown")
                 except requests.exceptions.ConnectionError:
                     st.error("Error: Could not connect to the backend. Is your FastAPI server running on port 8000?")
                 except requests.exceptions.HTTPError as http_err:
                     st.error(f"Backend Error: {response.json().get('detail', str(http_err))}")
                 except Exception as e:
                     st.error(f"An error occurred: {str(e)}")
+                finally:
+                    try:
+                        os.unlink(tmp_file_path)
+                    except Exception:
+                        pass
