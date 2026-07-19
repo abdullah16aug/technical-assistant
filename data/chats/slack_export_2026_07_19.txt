@@ -1,0 +1,891 @@
+[2026-07-15 09:01:12] dev_rahul: Anyone know if we have a single “source of truth” doc for what’s actually in our GCP data stack? I’m onboarding a new ETL for marketing and I’m not sure if I should default to Dataflow or Dataproc for a Spark job.
+[2026-07-15 09:03:27] lead_aman: Yeah, there’s an internal best practices doc specifically for the Data Engineering team on GCP. It has the canonical list of what we support. Check `data/docs/gcp.md`, section “Overview”.
+[2026-07-15 09:05:02] data_vishal: Pulled it up just now. The stack we officially support there is: GCP core, BigQuery, GCS, Pub/Sub, Dataflow, Dataproc, Cloud Composer (Airflow), Databricks, Apache Spark, Python, and Terraform.
+[2026-07-15 09:06:11] dev_rahul: Nice, thanks. For Spark specifically, are we steering people more to Dataproc or Databricks according to that overview, or is it just listing both as supported?
+[2026-07-15 09:08:44] sre_neha: The overview doc is neutral — it only enumerates what’s in our tech stack, doesn’t prescribe when to use which. It just states that both Dataproc and Databricks are part of the supported stack, along with Spark itself.
+[2026-07-15 09:10:19] ops_priya: Also worth noting from that same overview: orchestration is standardized on Cloud Composer (Airflow), and infra is managed with Terraform. So whatever you choose (Dataflow/Dataproc/Databricks), plan to wire it via Composer and provision via Terraform.
+[2026-07-15 09:12:02] lead_aman: To answer your immediate question: if it’s Spark and you don’t have a constraint pushing you one way, both Dataproc and Databricks are “blessed” per that doc. For a quick start, Dataproc is usually simpler to align with our existing GCP-native stack (BigQuery, GCS, Pub/Sub, Dataflow), but that’s a convention, not something stated in the overview.
+[2026-07-15 09:13:37] dev_rahul: Got it. I’ll stick with Dataproc for this one and orchestrate via Composer, infra in Terraform, outputs into BigQuery with GCS as the staging layer. That’s all consistent with what’s listed in `gcp.md`. Thanks all, that answers my question.
+
+[2026-07-16 09:02:11] dev_rahul: Morning, quick question on our GCP stack. For a new batch pipeline (daily partitioned loads into BigQuery from GCS), should I be defaulting to Dataflow or Dataproc? I'm a bit confused since both are in our standard tech list.
+[2026-07-16 09:04:03] lead_aman: Hey Rahul, good one. Can you share what the pipeline looks like? Is it more streaming-ish with Pub/Sub or classic ETL from Cloud Storage into BigQuery?
+[2026-07-16 09:06:27] dev_rahul: Classic ETL for now: files land in a GCS bucket, we do some transformations in Python/Spark, then load into BigQuery. No Pub/Sub in the first phase, but we might add a near-real-time path later.
+[2026-07-16 09:08:10] data_vishal: In that case, our default in GCP tends to be Dataflow for managed pipelines, especially when we know Pub/Sub and streaming could come in later. It fits nicely with GCS → BigQuery and scales better without us managing clusters.
+[2026-07-16 09:10:42] sre_neha: +1 to Dataflow if you don’t need tight control over the Spark runtime. We usually reserve Dataproc or Databricks for heavier Spark workloads or when we need more custom cluster configs. For scheduled batch, we’d orchestrate Dataflow jobs via Cloud Composer anyway.
+[2026-07-16 09:12:35] ops_priya: Also from an ops angle, Dataflow + Composer means fewer moving parts to babysit. Dataproc clusters add overhead (lifecycle, tuning), whereas Dataflow is more “serverless” in our GCP setup.
+[2026-07-16 09:14:58] lead_aman: So consensus: for GCS → BigQuery daily batches, start with Dataflow, orchestrated by Cloud Composer. If later you find you need specialized Spark features or want to standardize with existing Databricks/Spark code, we can revisit Dataproc/Databricks.
+[2026-07-16 09:16:21] dev_rahul: Got it, I’ll design this as a Dataflow pipeline, triggered by Composer, with BigQuery as the sink. I’ll keep the transformations in Python so we can refactor to Spark later if needed.
+[2026-07-16 09:18:03] data_vishal: Sounds good. Don’t forget to keep the infra in Terraform when you define the GCS buckets, BigQuery datasets, and Composer bits so it’s aligned with our GCP best practices.
+[2026-07-16 09:19:27] dev_rahul: Perfect, that clears it up. I’ll draft the Terraform + Dataflow design and share a doc later today.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone have a minute? Our GCP bill for BigQuery just spiked and I suspect one of my reports is doing something dumb. The main query is basically `SELECT * FROM sales WHERE transaction_date >= '2026-01-01'`. Any obvious cost optimizations I should apply?
+[2026-07-15 09:05:03] lead_aman: Yeah, that's likely scanning way more data than needed. First thing: avoid `SELECT *`. Which columns does the report actually use downstream?
+[2026-07-15 09:07:22] dev_rahul: The dashboard only needs `customer_id`, `total_amount`, and `transaction_date` for filtering. Everything else is unused. The table is called `sales` like in the docs example.
+[2026-07-15 09:09:10] data_vishal: Then definitely trim it down. Pattern should look like:
+[2026-07-15 09:11:37] sre_neha: Also, is `sales` partitioned on `transaction_date`? If not, you're effectively forcing a full table scan every time you run that query with just a filter on date.
+[2026-07-15 09:13:44] ops_priya: +1 on partitioning. For that access pattern, we should use a partitioned table on `transaction_date` and maybe cluster by `customer_id` if we often filter/aggregate on it. That will cut down unnecessary full table scans on older partitions.
+[2026-07-15 09:16:02] lead_aman: To summarize the cost optimizations in this case:
+[2026-07-15 09:18:29] dev_rahul: Got it. I just updated the query to:
+[2026-07-15 09:20:41] data_vishal: Nice. Once clustering is in place, queries that filter or group by `customer_id` should get even cheaper and faster. That should keep the BigQuery costs under control for this report.
+[2026-07-15 09:22:07] dev_rahul: Perfect, thanks all. I’ll roll this into the scheduled report and monitor the next billing cycle to confirm the savings.
+
+[2026-07-16 09:01:12] dev_rahul: Anyone else noticing our BigQuery costs spiking on the daily sales report? The job `daily_sales_rollup` suddenly doubled in cost since last week.
+[2026-07-16 09:03:27] data_vishal: Yeah, I saw that in the billing dashboard. Slot usage went up and bytes processed for that query are ~2x. Do we know if someone changed the SQL?
+[2026-07-16 09:05:10] dev_rahul: Here’s the current query from the scheduled job:
+[2026-07-16 09:07:54] lead_aman: Yep, that’s almost certainly the culprit. From the GCP guidelines: avoid `SELECT *` and only pull the columns you actually need. What does the downstream report use? Just `customer_id` and `total_amount`, right?
+[2026-07-16 09:09:31] data_vishal: Correct, dashboard only needs `customer_id` and `total_amount`. Also, we should confirm the partition filter is in place exactly as `WHERE transaction_date >= '2026-01-01'` to avoid unnecessary full table scans. Looks like that part is fine.
+[2026-07-16 09:11:18] sre_neha: If the table is large, clustering might help too. Is `analytics.sales` clustered on anything like `customer_id`? Clustering large tables is recommended in our GCP doc.
+[2026-07-16 09:13:02] ops_priya: Just checked the schema: it’s partitioned by `transaction_date` but not clustered. For now, I’ll update the query in the scheduled job to:
+[2026-07-16 09:15:44] data_vishal: Nice. That aligns perfectly with the “query only required columns” rule and avoids a wider scan. After this run completes, we should see lower bytes processed in the job details.
+[2026-07-16 09:18:03] ops_priya: First run with the updated query just finished. Bytes processed dropped from ~1.2 TB to ~450 GB. Cost graph looks way healthier already.
+[2026-07-16 09:19:55] lead_aman: Great. Let’s also open a backlog ticket to add clustering on `customer_id` for `analytics.sales` since it’s a large table and heavily queried by that key. That’ll further reduce scan cost and improve performance.
+[2026-07-16 09:21:20] dev_rahul: Awesome, thanks all. I’ll document this under “Optimize Query Cost” in our internal wiki: no `SELECT *`, only needed columns, rely on partitioned tables, and avoid full table scans.
+
+[2026-07-15 09:02:11] dev_rahul: Quick question on the new payments_events table in BigQuery — it's going to grow continuously. Any guidance on what we should use for partitioning?
+[2026-07-15 09:04:03] lead_aman: For any table that's going to keep growing, we definitely want it partitioned. Do we have a date-like column already? Think transaction_date, created_at, or ingestion_date.
+[2026-07-15 09:06:12] dev_rahul: Schema has all three actually: transaction_date (from the PSP), created_at (our app time), and ingestion_date (when the pipeline lands it in BQ). Not sure which is best from a cost/perf perspective.
+[2026-07-15 09:08:27] data_vishal: Since this is payments_events, most of our analytics and dashboards filter by when the transaction actually happened, so transaction_date is the best partition column. That aligns with the recommendation and will keep query costs down + make them faster.
+[2026-07-15 09:10:09] sre_neha: +1 to partitioning on transaction_date. Also, from an ops standpoint, alerting and SLA metrics are based on actual transaction time, so having partitions aligned to that date makes debugging and backfills easier.
+[2026-07-15 09:12:45] ops_priya: Just to confirm: we're not considering ingestion_date because we rarely query by ingestion time, right? We still get the lower storage scan cost and better performance as long as most queries have a WHERE on transaction_date?
+[2026-07-15 09:14:58] data_vishal: Exactly. Partitioning works best when your common filters match the partition column. Using transaction_date means most queries will only scan the relevant partitions, so we get both benefits from the doc: lower cost and faster queries. ingestion_date is more for pipeline monitoring scenarios.
+[2026-07-15 09:17:20] lead_aman: Cool, let's standardize: for any continuously growing transactional table, default to partitioning on transaction_date; if that's missing, fall back to created_at; ingestion_date only when we're primarily doing ingestion-lag style analysis.
+[2026-07-15 09:19:02] dev_rahul: Got it. I’ll set up payments_events partitioned by transaction_date and update the design doc to reflect that pattern and the cost/perf rationale.
+[2026-07-15 09:20:44] lead_aman: Perfect. Once that’s in, ping BI so they can make sure all their queries include transaction_date filters to fully leverage the partitioning.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone around? I'm modeling the `payments_events` table in BigQuery and wondering if we should bother with partitioning or just leave it as a regular table since it's still small right now.
+[2026-07-16 09:04:03] lead_aman: For any table that's going to keep growing over time, we should be partitioning it. That `payments_events` table will get continuous inserts, right?
+[2026-07-16 09:06:25] dev_rahul: Yeah, it'll get a steady stream from the ingestion pipeline. What's our recommended column to partition on? I see `transaction_date`, `created_at`, and an `ingestion_date` we add in the ETL.
+[2026-07-16 09:08:47] data_vishal: Stick to the guidance from our GCP notes: for continuously growing tables, partition on a date-like column such as `transaction_date`, `created_at`, or `ingestion_date`. For analytics, I’d lean `transaction_date` if queries are mostly business-date driven.
+[2026-07-16 09:11:02] sre_neha: Also remember: partitioning is not just for organization. It directly reduces scanned data, so we get both lower cost and faster queries, especially for time-bounded reports.
+[2026-07-16 09:13:30] ops_priya: +1. Most dashboards filter by business date, not ingestion time. So partition by `transaction_date`, and make sure all Looker/BI queries include a date filter so we actually benefit from the partitions.
+[2026-07-16 09:15:18] dev_rahul: Got it. I'll define it as a partitioned table on `transaction_date` then. That should give us the lower cost + speed benefits as volume grows.
+[2026-07-16 09:16:59] lead_aman: Sounds good. Please add a short note in the table README explaining why we chose `transaction_date` and that partitioning is required for all continuously growing tables.
+[2026-07-16 09:18:41] dev_rahul: Done and pushed. Thanks all, that clears it up.
+
+[2026-07-15 09:02:11] dev_rahul: Quick question on the new analytics table in BigQuery: do we want to set up clustering, and if yes, on which columns? The doc just says "cluster by frequently filtered columns" with examples but I'm not sure what to pick for our use case.
+[2026-07-15 09:04:37] data_vishal: For clustering, we should stick to what the doc suggests: pick the columns we filter on the most. In our queries it's usually `customer_id` and sometimes `country`, rarely `product_id`. So I'd start with `customer_id`, maybe add `country` as a secondary.
+[2026-07-15 09:07:10] lead_aman: +1 to Vishal. The guideline is literally "cluster by frequently filtered columns", and the examples match our schema: `customer_id`, `country`, `product_id`. Since almost every dashboard query has a `WHERE customer_id = ...`, that should be our primary clustering field.
+[2026-07-15 09:09:02] ops_priya: Just to confirm, we’re not doing partitioning here, only clustering, right? If so, I’ll update the infra script to create the table with `CLUSTER BY customer_id, country`.
+[2026-07-15 09:11:45] sre_neha: Yeah, partitioning is a separate decision. For clustering, following the doc, `customer_id` and `country` are safe since they’re frequently used in filters. `product_id` is mostly used in aggregates across all customers, so clustering on that might not help as much.
+[2026-07-15 09:14:03] dev_rahul: Makes sense. So final call: `CLUSTER BY customer_id, country` and skip `product_id` for now since it’s not as heavily filtered?
+[2026-07-15 09:16:28] lead_aman: Yes, that aligns perfectly with the guidance: use the frequently filtered columns, and in our case that’s `customer_id` first, then `country`. We can always revisit and add `product_id` later if query patterns change.
+[2026-07-15 09:18:12] ops_priya: Cool, updating the Terraform now to cluster by `customer_id, country`. I’ll run `terraform apply` on staging and we can validate query performance there.
+[2026-07-15 09:21:47] data_vishal: Staging table is up with clustering on those two columns. I ran a couple of `WHERE customer_id = '123' AND country = 'US'` queries and they look good. Let’s stick with this config.
+
+[2026-07-16 09:02:11] dev_rahul: Quick question on BigQuery table design: for our new orders table, should we be setting any clustering, or is partitioning enough?
+[2026-07-16 09:04:03] lead_aman: For clustering, we should base it on columns we filter on a lot. From the GCP doc: think things like customer_id, country, product_id.
+[2026-07-16 09:06:12] data_vishal: Yeah, looking at existing queries, most of our WHERE clauses are on customer_id and sometimes country. product_id is more for aggregations than strict filters.
+[2026-07-16 09:08:37] sre_neha: So we’d get the most benefit clustering by customer_id then, right? Since clustering is explicitly recommended for frequently filtered columns.
+[2026-07-16 09:10:01] ops_priya: +1. Also, country is often part of the filter too. Any downside to using both customer_id and country as the cluster keys?
+[2026-07-16 09:12:45] lead_aman: Using multiple clustering columns is fine as long as they’re all commonly used in filters. customer_id first, then country matches our patterns and stays within what the doc suggests (it literally calls those out as examples).
+[2026-07-16 09:14:30] dev_rahul: Got it. So final decision: cluster the orders table by (customer_id, country), since those are our most frequently filtered columns, and skip product_id for now?
+[2026-07-16 09:16:02] data_vishal: Yep, that aligns with the guidance: “Cluster by frequently filtered columns” and the examples list exactly those. We can always revisit and add product_id later if our query patterns change.
+[2026-07-16 09:18:27] sre_neha: Cool, I’ll update the infra config to set clustering on customer_id, country for the new table.
+[2026-07-16 09:19:55] dev_rahul: Perfect, I’ll adjust the dbt model to match. Thanks all.
+
+[2026-07-15 09:01:12] dev_rahul: Anyone know why our Spark job on GCP Dataproc is spending ~70% of its time in shuffle? I'm seeing a ton of `ShuffleBlockFetcherIterator` in the stage 3 UI, and the main transformation is a `groupByKey()` on a big RDD.
+[2026-07-15 09:03:27] lead_aman: Yeah, `groupByKey()` is usually the culprit for heavy shuffle. Can you paste the relevant code snippet from that stage?
+[2026-07-15 09:05:10] dev_rahul: Sure, core part looks like this:
+[2026-07-15 09:07:42] sre_neha: That explains it. `groupByKey()` shuffles *all* values for a key across the cluster. Per our GCP Spark guidelines, we should minimize shuffle and avoid `groupByKey()` when possible.
+[2026-07-15 09:09:03] lead_aman: Since you're just summing values per key, this should be `reduceByKey()` instead. It does map-side combining and reduces the shuffle footprint.
+[2026-07-15 09:11:18] dev_rahul: So something like:
+[2026-07-15 09:13:02] lead_aman: Exactly. That's the recommended pattern: lower shuffle operations whenever possible, and prefer `reduceByKey()` (or `aggregateByKey()` if you need more complex aggregation) over `groupByKey()`.
+[2026-07-15 09:14:55] data_vishal: +1. If later you need to track both sum and count per user, switch to:
+[2026-07-15 09:17:21] sre_neha: Also, once you push that change, keep an eye on the Dataproc job metrics. You should see fewer shuffle read/write bytes and lower stage duration for that aggregation stage.
+[2026-07-15 09:19:08] dev_rahul: Just updated to `reduceByKey` and reran on the same input. Shuffle read dropped from ~48GB to ~19GB and stage 3 time went from ~11m to ~3m. Looks good.
+[2026-07-15 09:20:44] lead_aman: Nice. Let's add a note to our internal GCP Spark doc: "avoid `groupByKey()`, use `reduceByKey()`/`aggregateByKey()` to reduce shuffle" so others don't hit the same issue.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know why our GCP Dataproc job is suddenly 2x slower after the last change to the session aggregation pipeline? The stage "sessionizeEvents" is showing massive shuffle read/write in the Spark UI.
+[2026-07-16 09:04:33] data_vishal: Looking at yesterday vs today: shuffle read went from ~3GB to ~11GB on that stage. Rahul, did we change any of the key-based aggregations? I see a lot more tasks stuck on shuffle fetch.
+[2026-07-16 09:07:10] dev_rahul: Yeah, I refactored the session aggregation to make it "cleaner". I replaced a `reduceByKey` with a `groupByKey` then a map, like:
+[2026-07-16 09:10:42] lead_aman: Yep, that’ll do it. We explicitly call out in our guidelines: we should reduce shuffle wherever possible and avoid `groupByKey()` for this reason. For key aggregations, prefer `reduceByKey()` or `aggregateByKey()` instead of `groupByKey()`.
+[2026-07-16 09:13:05] sre_neha: +1, from the cluster side I see a bunch of shuffle-related warnings:
+[2026-07-16 09:16:27] data_vishal: Rahul, you can keep the same logic but push the aggregation into the shuffle step. Something like:
+[2026-07-16 09:19:48] dev_rahul: Got it. I’ll swap `groupByKey()` back to `reduceByKey()` with our existing `mergeSessions` function. Kicking off a test run on the smaller dataset now.
+[2026-07-16 09:23:12] ops_priya: Monitoring the test job on Dataproc now. Shuffle read on that stage is ~3.2GB instead of 11GB, and total job time dropped from ~24 min to ~11 min. No more shuffle fetch warnings in the logs.
+[2026-07-16 09:25:44] lead_aman: Nice. Let’s codify this in the style guide: “For per-key aggregations, never use `groupByKey()`; always use `reduceByKey()` or `aggregateByKey()` to minimize shuffle.” Rahul, can you also add a short comment in the code explaining why?
+[2026-07-16 09:28:09] dev_rahul: Comment added and MR updated. Thanks all for the quick help—lesson learned: avoid `groupByKey()` when we care about shuffle.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone around? I'm seeing a super slow join between `orders` and `customers` in our PySpark job on GCP. Job is spending ~80% of the time in the shuffle stage for that join.
+[2026-07-15 09:04:03] data_vishal: Checking. How big is `customers` vs `orders`? If one of them is small we might be able to optimize with a broadcast join.
+[2026-07-15 09:06:17] dev_rahul: `orders` is ~200M rows, `customers` is ~50k rows. Current code is just:
+[2026-07-15 09:08:45] lead_aman: With `customers` that small, we should definitely be using a broadcast join so we avoid the big shuffle on `customer_id`. Spark can ship the small table to all executors.
+[2026-07-15 09:10:12] data_vishal: Yep, from our patterns doc: when one table is small, wrap it with `broadcast`. Something like:
+[2026-07-15 09:12:01] sre_neha: +1. Also verify in the Spark UI that the join type changes and the shuffle size drops. But this is the recommended approach for small dimension tables like `customers`.
+[2026-07-15 09:13:37] dev_rahul: Got it. I’ll update to:
+[2026-07-15 09:16:29] ops_priya: Keep an eye on executor memory after enabling broadcast, but with 50k rows it should be negligible.
+[2026-07-15 09:18:54] dev_rahul: Rerun finished: job time dropped from ~18 mins to ~4 mins, shuffle stage is tiny now and Spark UI shows "BroadcastHashJoin". Looks like that did the trick.
+[2026-07-15 09:20:11] lead_aman: Nice. Let’s add a comment in the code explaining why we’re broadcasting `customers`, and maybe a note in the runbook: "Use broadcast joins when one table is small."
+
+[2026-07-16 09:02:11] dev_rahul: Quick PySpark question: I’ve got a join between `orders` (~200M rows) and `customers` (~50k rows) on `customer_id`, and the job is super slow. Should we be doing some kind of broadcast join here, and if yes, what’s the exact syntax?
+[2026-07-16 09:04:37] data_vishal: Yeah, that’s a good candidate for a broadcast join since `customers` is small. Spark can ship that small table to all executors instead of shuffling `orders`.
+[2026-07-16 09:07:12] lead_aman: +1, for small dimension tables we should explicitly broadcast so the optimizer doesn’t miss it. Use `pyspark.sql.functions.broadcast` on the small side of the join.
+[2026-07-16 09:09:03] dev_rahul: Got it. Just to confirm, something like this is correct?
+[2026-07-16 09:11:28] data_vishal: That snippet is exactly what we want. Default join type is inner, which matches your use case, so no need to specify unless you want left/right/outer. Key thing is wrapping `customers` with `broadcast(...)`.
+[2026-07-16 09:13:44] sre_neha: Also make sure you’re importing it properly:
+[2026-07-16 09:16:02] ops_priya: If you can paste the physical plan after you change it, we can sanity check:
+[2026-07-16 09:18:27] dev_rahul: Updated the code with:
+[2026-07-16 09:20:10] lead_aman: Perfect, that’s the intended pattern: use broadcast joins when one table is small, wrap the small DF with `broadcast()`, and join on the key. Let’s add this example to our internal Spark tips doc so others don’t miss it.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone else seeing executors OOM on the GCP Dataproc job `daily_agg_v2`? It started after I added a `df.cache()` on the main DataFrame.
+[2026-07-15 09:04:03] lead_aman: What exactly are you caching, Rahul? Is that DF reused multiple times or just once in the pipeline?
+[2026-07-15 09:05:27] dev_rahul: Here's the relevant snippet:
+[2026-07-15 09:07:10] sre_neha: Yeah, that would explain the memory pressure. From the gcp docs: we should only cache DataFrames that are reused, and always unpersist after we're done. You're caching a DF that's used for a single aggregation and then never explicitly unpersisting it.
+[2026-07-15 09:09:32] ops_priya: Logs from one of the failing executors:
+[2026-07-15 09:11:01] data_vishal: In this case you can just drop the cache entirely. If you really need it later, pattern should be:
+[2026-07-15 09:13:18] dev_rahul: Got it. I’ll remove the `df.cache()` since it’s only used once, and for another job where I do reuse it I’ll add:
+[2026-07-15 09:16:44] sre_neha: Watching the job in the Dataproc UI—memory usage looks stable now, no new OOMs, and the stage that used to die just completed. Looks like removing that unnecessary cache fixed it.
+[2026-07-15 09:18:02] lead_aman: Nice. Let’s also add a short note to the job’s README: “Cache only reused DataFrames and always unpersist after usage,” with that code snippet, so we don’t repeat this.
+
+[2026-07-16 09:01:12] dev_rahul: Anyone else noticing executors running out of memory on the GCP Dataproc job for the daily aggregation? It started after I added a couple of `.cache()` calls on some intermediate DataFrames.
+[2026-07-16 09:03:45] lead_aman: Can you paste the relevant snippet where you added cache? Also, are you unpersisting anywhere after you're done with those DataFrames?
+[2026-07-16 09:05:02] dev_rahul: Here's the bit I changed:
+[2026-07-16 09:07:18] sre_neha: That’s likely the issue. From our GCP Spark guidelines: only cache DataFrames that are actually reused, and always unpersist after usage. Are `df_enriched` and `df_joined` used multiple times, or just once in that flow?
+[2026-07-16 09:09:01] dev_rahul: `df_enriched` is used twice (one path for metrics, another for a QA sample), but `df_joined` is only used once to compute `result`. So I guess caching `df_joined` is pointless?
+[2026-07-16 09:11:27] data_vishal: Exactly. If `df_joined` feeds a single action, caching just bloats executor memory. Do:
+[2026-07-16 09:14:03] ops_priya: Also, I see in the current run logs:
+[2026-07-16 09:16:22] lead_aman: This aligns with the “cache carefully” note in our docs: cache only reused DataFrames and always unpersist after they’re no longer needed. Rahul, can you patch as Vishal suggested and re-run on the same cluster config to confirm the OOM goes away?
+[2026-07-16 09:19:40] dev_rahul: Patch applied, re-running now. Executors are stable so far, memory usage is ~55% instead of creeping past 90%. Job just finished in 18 min vs 26 min earlier, and no `ExecutorLostFailure` or YARN kill messages. Looks like removing the extra cache and adding `unpersist()` fixed it.
+[2026-07-16 09:21:03] sre_neha: Nice. Let’s capture this as a note in the job’s README: where we cache, how many times it’s reused, and where we `unpersist()`. That should prevent future “just add cache everywhere” optimizations.
+[2026-07-16 09:22:47] dev_rahul: Done, README updated with the caching rationale and the `df.unpersist()` pattern. Thanks all, lunch is on me if we get through the rest of the pipeline without more OOMs today.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone seeing DAGs not triggering in Composer this morning? My daily ETL DAG hasn't run since 7am, but it's not marked as failed or anything.
+[2026-07-15 09:04:33] ops_priya: Checking the Composer env now. First guess is the scheduler might have stopped. Let me look at the Airflow UI / logs.
+[2026-07-15 09:07:45] ops_priya: Yeah, in the Airflow UI the scheduler status shows as "Down". Scheduler logs are basically flat after 06:58. This fits the "Scheduler stopped" issue from our Composer notes.
+[2026-07-15 09:09:02] lead_aman: If scheduler is down, DAGs won't get picked up at all. Priya, can you try restarting the Composer environment scheduler via GCP console? That usually clears transient scheduler stopped issues.
+[2026-07-15 09:11:28] ops_priya: On it. Triggered an environment update with a no-op change to force a restart of the components. Also manually clicked "Restart scheduler" from the Composer UI. Give it 3–4 mins.
+[2026-07-15 09:14:56] sre_neha: While that restarts, Rahul, no errors in your DAG itself right? No missing dependencies or bad connections? Those would show as task failures, but scheduler being down explains "no runs at all".
+[2026-07-15 09:16:10] dev_rahul: Yeah, DAG code hasn't changed since yesterday and it ran fine then. No new packages or connections. This feels more like global scheduler behavior than a DAG issue.
+[2026-07-15 09:18:37] ops_priya: Scheduler is back to "Healthy" in the UI now. I see new log entries like:
+[2026-07-15 09:20:05] data_vishal: I see your ETL DAG just got a new run at 09:19 in the UI. Tasks are queued and a couple already in running state, so scheduler being stopped was definitely the root cause.
+[2026-07-15 09:22:41] lead_aman: Nice. Let's add a quick note to our Composer runbook under "Common issues -> Scheduler stopped" that DAGs silently stop triggering and the fix is to restart the scheduler / env. Also worth adding a basic alert on scheduler health so we don't discover this an hour late.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone around for Composer? Our DAGs haven’t run since ~7am. In the UI they’re still scheduled, but nothing is getting picked up.
+[2026-07-16 09:04:03] sre_neha: Checking now. Do you see any recent tasks in the “Browse -> Jobs -> Scheduler Jobs” page or is it completely empty?
+[2026-07-16 09:06:27] dev_rahul: Scheduler jobs list is basically stale. Last heartbeat around 06:59. After that, no new entries. Feels like the scheduler just died.
+[2026-07-16 09:08:10] ops_priya: That aligns with the “Scheduler stopped” issue we’ve seen in Composer. Can you grab the scheduler logs from the environment? Specifically around 06:55–07:05.
+[2026-07-16 09:10:42] dev_rahul: Pulled from Logs Explorer. Seeing this repeating:
+[2026-07-16 09:13:19] lead_aman: Ok, so scheduler is definitely stopped. In Composer the usual fix is to restart the scheduler component. Neha / Priya, can one of you do a restart from the Composer environment page?
+[2026-07-16 09:15:02] ops_priya: On it. Going to the Composer env -> “Restart web server, scheduler, and workers”. I’ll trigger just the scheduler restart first.
+[2026-07-16 09:18:27] ops_priya: Scheduler restart completed. New logs are flowing:
+[2026-07-16 09:20:11] dev_rahul: I see new runs getting queued now. The DAG that was stuck at 07:00 just kicked off with a 09:20 run. Looks like that fixed it.
+[2026-07-16 09:22:45] lead_aman: Nice. Let’s note this as a standard “Cloud Composer: Scheduler stopped -> restart scheduler” playbook item. Rahul, keep an eye on it for the next hour; if it dies again we’ll dig deeper, but for now we’re good.
+
+[2026-07-15 09:01:12] dev_rahul: Anyone remember the right place to ack Pub/Sub messages in our worker? Seeing some duplicate processing in the order pipeline this morning.
+[2026-07-15 09:03:08] sre_neha: What pattern are you using right now? Are you acking on receipt or after the handler finishes?
+[2026-07-15 09:05:02] dev_rahul: Currently it's roughly:
+[2026-07-15 09:07:45] lead_aman: That’s inverted. For Pub/Sub we must only ack after successful processing. Otherwise on failures you might think it's safe, but if you crash mid-process, Pub/Sub won’t redeliver and you lose messages. Conversely, if you delay ack too long or never ack on success, Pub/Sub will redeliver and you’ll see duplicates.
+[2026-07-15 09:09:31] ops_priya: The doc we have is explicit: flow should be "Receive → Process → Ack". And it says if we don’t ack after successful processing, duplicate delivery will happen. So your current flow is breaking that contract.
+[2026-07-15 09:11:56] dev_rahul: Got it. So correct pattern is:
+[2026-07-15 09:13:40] data_vishal: Yeah, that lines up with the pseudo flow in our GCP notes. Also explains the duplicates I saw in the analytics table — same messageId processed twice when the worker crashed before acking properly in some older code.
+[2026-07-15 09:16:02] sre_neha: Exactly. Ack only after `processOrder` completes successfully. If it fails, we intentionally don’t ack so Pub/Sub redelivers. That’s how we avoid both data loss and unexpected duplicates beyond the at-least-once guarantee.
+[2026-07-15 09:18:27] dev_rahul: Patch is in for the worker with the updated order: Receive → Process → Ack. Rolling it out to staging now and will monitor for duplicates.
+[2026-07-15 09:21:10] ops_priya: Just checked staging logs for the last 5 minutes, no repeat processing for the same message IDs anymore. Looks like fixing the ack position resolved the duplicate issue.
+[2026-07-15 09:22:44] lead_aman: Nice. Let’s add a quick note to our service template: “Always ack Pub/Sub messages only after successful processing, otherwise expect duplicate delivery.”
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know why our Pub/Sub consumer is suddenly processing some events twice? Seeing duplicate DB rows for the same message_id in the orders service.
+[2026-07-16 09:04:03] sre_neha: Checking. Are we definitely acking the message only after processing is done? Pub/Sub will redeliver if it doesn’t see an ack.
+[2026-07-16 09:06:27] dev_rahul: Current flow in the worker is roughly:
+[2026-07-16 09:08:15] lead_aman: That ordering is risky. From the doc: receive → process → ack. If processing fails after ack, we’ve already told Pub/Sub we’re done, so retries won’t help and you’ll need idempotency on your side.
+[2026-07-16 09:10:42] ops_priya: Also, if `process_order` throws before ack (in a different code path), the message won’t be acked at all and Pub/Sub will deliver it again. That’s where your duplicates are likely coming from.
+[2026-07-16 09:12:09] data_vishal: +1, I’m seeing the same message_id with different delivery attempts in our logs. Pub/Sub is doing duplicate delivery because it never got a successful ack after processing.
+[2026-07-16 09:14:36] sre_neha: We should strictly follow: Receive Message → Process → Ack Message. That’s the pseudo-flow. “Always acknowledge messages after successful processing. Otherwise duplicate delivery occurs.” That’s exactly what you’re seeing.
+[2026-07-16 09:16:58] dev_rahul: Got it. I’ll flip it:
+[2026-07-16 09:20:31] ops_priya: Watching metrics… redelivery count is stable, and I don’t see new duplicate rows in the DB over the last 5 minutes. Looks good.
+[2026-07-16 09:22:04] lead_aman: Nice. Let’s also add a short comment in the handler referencing the required flow (Receive → Process → Ack) so no one “optimizes” it back later.
+[2026-07-16 09:23:45] dev_rahul: Done and merged. Duplicates stopped showing up in my test topic as well. Thanks all.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone know why our new Dataflow job is stuck at just 2 workers even though load has spiked? Throughput tanked after today's deploy.
+[2026-07-15 09:04:03] lead_aman: First check: did we actually enable autoscaling on that pipeline? If it's off, it'll stay at whatever number of workers you started with.
+[2026-07-15 09:05:27] dev_rahul: I spun it up via the template UI, but I might've left defaults. In the job details I see:
+[2026-07-15 09:07:12] sre_neha: Yeah, for our Dataflow jobs we should be:
+[2026-07-15 09:09:08] ops_priya: +1. Also noticing from the logs:
+[2026-07-15 09:11:21] data_vishal: The new transform I added does a bunch of per-element JSON parsing + enrichment. I can batch that, but short term should I just redeploy with:
+[2026-07-15 09:13:06] lead_aman: Yes, redeploy with autoscaling on + `n2-standard-4` as worker type. Then create a follow-up ticket to refactor that expensive DoFn into something lighter (or batch ops). Dataflow guidance is to avoid heavy DoFn logic exactly for this reason.
+[2026-07-15 09:15:22] dev_rahul: Redeployed with:
+[2026-07-15 09:17:03] sre_neha: Nice, looks healthy from my side too. CPU per worker ~55%, and autoscaler is still adding a couple more. Once Vishal trims that DoFn, we should be even better.
+[2026-07-15 09:18:44] data_vishal: Cool, I’ll open a task to simplify the DoFn and avoid the expensive per-element work. For now, confirmed: enabling autoscaling + switching to `n2-standard-4` fixed the immediate issue.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone familiar with our Dataflow setup? This new pipeline is lagging badly on the last stage. Workers are pegged at 100% CPU and autoscaling doesn’t seem to kick in at all.
+[2026-07-16 09:04:03] ops_priya: Checking the job details now. What worker machine type did you pick and is autoscaling actually enabled in the template?
+[2026-07-16 09:06:12] dev_rahul: For this run I used `n1-standard-2` and left autoscaling off because I thought fixed size would be simpler. The slow step is a DoFn that does a bunch of per-record transformations + some extra checks.
+[2026-07-16 09:08:55] lead_aman: That explains a lot. Our Dataflow guidelines say we should enable autoscaling and use `n2-standard-4` as the recommended worker type. Also they explicitly warn to avoid expensive logic inside DoFns.
+[2026-07-16 09:11:27] sre_neha: +1. With autoscaling disabled, the job can’t add workers when load spikes. On a smaller machine type like `n1-standard-2` the CPU saturation will be worse, especially if that DoFn is heavy.
+[2026-07-16 09:13:40] data_vishal: Can you paste a snippet of the DoFn? Just want to sanity-check if we’re doing anything obviously expensive that we can move out or precompute.
+[2026-07-16 09:16:05] dev_rahul: It’s roughly: parsing JSON, then some conditional mapping, plus a couple of extra validation passes over the same element. I guess that’s pretty heavy. I can refactor to combine the passes and pre-parse part of it upstream.
+[2026-07-16 09:18:44] lead_aman: Sounds good. For the next run, switch workers to `n2-standard-4`, enable autoscaling, and deploy the lighter DoFn. That aligns with our Dataflow recommendations and should fix both the CPU and latency issues.
+[2026-07-16 09:21:10] ops_priya: I’ve updated the launch config: worker type set to `n2-standard-4`, autoscaling turned on. Kicking off a new job now with your refactored DoFn.
+[2026-07-16 09:24:52] sre_neha: New job looks much healthier. CPU is around 55–60%, autoscaling bumped us up a few workers during the peak, and end-to-end latency is down a lot compared to the previous run.
+[2026-07-16 09:27:03] data_vishal: Nice. Let’s capture this: for Dataflow, stick to `n2-standard-4`, always enable autoscaling unless there’s a very specific reason not to, and keep DoFn logic lean.
+[2026-07-16 09:29:18] dev_rahul: Perfect, thanks all. I’ll update the pipeline doc with these Dataflow best practices so we don’t repeat this.
+
+[2026-07-15 09:02:11] dev_rahul: Folks, quick Dataproc question — our nightly batch cluster has been sitting around all day and I’m seeing unexpected GCP costs. Are we supposed to keep that cluster running 24/7 or is there a better pattern?
+[2026-07-15 09:04:03] lead_aman: That cluster shouldn’t be long‑lived. For batch workloads on Dataproc we should be using ephemeral clusters that spin up for the job and then go away.
+[2026-07-15 09:06:27] sre_neha: +1, Dataproc best practice is ephemeral clusters for batch. Also, if a cluster *is* up, we should have it terminate when idle so we’re not paying for idle workers.
+[2026-07-15 09:08:10] ops_priya: Checking the current config… looks like the nightly cluster is created once and reused, no idle termination, no autoscaling policy attached. It’s basically a static cluster.
+[2026-07-15 09:10:42] data_vishal: That explains the cost spike. We also want autoscaling policies on Dataproc so the cluster can scale up for heavy parts of the batch and scale down when load drops instead of sitting overprovisioned.
+[2026-07-15 09:13:01] dev_rahul: Got it. So the right fix is: convert this to an ephemeral Dataproc cluster per run, attach an autoscaling policy, and make sure it terminates once the job is done/idle, right?
+[2026-07-15 09:15:26] lead_aman: Exactly. For the pipeline: have the scheduler create an ephemeral Dataproc cluster with an autoscaling policy, run the batch job, and let it auto‑terminate when idle. That aligns with how we’re supposed to use Dataproc.
+[2026-07-15 09:18:47] ops_priya: I’ll update the deployment: switch to per‑job ephemeral clusters, enable idle termination, and wire in an autoscaling policy. I’ll also add a note in our runbook so we don’t create long‑lived Dataproc clusters for batch again.
+[2026-07-15 09:21:12] sre_neha: Once that’s in place, we should see the cluster only exist during the batch window, scale based on the autoscaling policy, and disappear when idle. That should keep Dataproc costs under control.
+[2026-07-15 09:23:39] dev_rahul: Perfect, that answers it. I’ll refactor the job launcher to assume ephemeral Dataproc clusters and not rely on a persistent one.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone around? Our Dataproc costs spiked ~30% this week and FinOps is asking if we're doing something wrong with how we run the batch jobs.
+[2026-07-16 09:04:03] lead_aman: Looking at last night's run, I see a couple of Dataproc clusters sitting around for hours after the Spark jobs finished. Are we actually terminating idle clusters or just leaving them up?
+[2026-07-16 09:06:27] ops_priya: For the main ETL pipeline, the cluster is long‑lived. We never wired in auto‑termination, so it just stays idle between runs. That's probably a big chunk of the waste.
+[2026-07-16 09:09:12] sre_neha: Yeah, we should be terminating idle clusters. For these nightly batch workloads, it's better to treat the clusters as ephemeral: spin up for the job, then tear down as soon as it's done instead of keeping them warm.
+[2026-07-16 09:12:48] data_vishal: +1 on ephemeral. Also, we're not using any autoscaling policies on these clusters. The worker count is fixed even when the job is barely doing anything, so we pay for full capacity the whole time.
+[2026-07-16 09:15:31] dev_rahul: Makes sense. So for best practice: use autoscaling policies on the Dataproc clusters, prefer ephemeral clusters for the batch ETL, and ensure idle clusters are terminated quickly, right?
+[2026-07-16 09:18:44] lead_aman: Exactly. For this pipeline specifically: define an autoscaling policy, attach it to the Dataproc cluster, switch the job runner to create an ephemeral cluster per batch, and configure it so the cluster is terminated when the job completes or goes idle.
+[2026-07-16 09:21:02] ops_priya: Got it. I’ll update the deployment templates so the batch jobs use ephemeral Dataproc clusters with autoscaling policies, and add an explicit idle‑termination setting. That should bring the costs back in line.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone know why my Composer DAG can't write to GCS in the new GCP project? The task is failing with a 403 on `storage.objects.create` even though the project owner said "IAM is wide open".
+[2026-07-15 09:04:09] ops_priya: Checking now. Which service account is the DAG using? The Composer worker SA or a custom one?
+[2026-07-15 09:06:15] dev_rahul: It's using the default Composer worker SA. In the task logs I see:
+[2026-07-15 09:08:32] lead_aman: For this, the Composer worker needs a role that can manage objects in that bucket. From our IAM docs the relevant one is `Storage Object Admin`. Do you see that role on the bucket or at project level for the worker SA?
+[2026-07-15 09:10:01] ops_priya: Just checked IAM. The Composer worker SA only has `Composer Worker` and some basic logging roles at the project level. No `Storage Object Admin` on the bucket. So the 403 makes sense.
+[2026-07-15 09:12:44] sre_neha: Yeah, and we should stick to least privilege. If the DAG only needs to create/update/delete objects, `Storage Object Admin` on that specific bucket is fine. No need to give it at project scope.
+[2026-07-15 09:14:27] data_vishal: +1 on scoping to the bucket. Also, if later we run BigQuery jobs from this DAG, remember to add `BigQuery Job User` and probably `BigQuery Data Editor` on the target dataset, but let's not preemptively grant those now.
+[2026-07-15 09:16:03] ops_priya: I’ve just added `Storage Object Admin` for the Composer worker SA on the target bucket only. No other roles changed. Give it a minute and rerun the DAG.
+[2026-07-15 09:18:47] dev_rahul: Reran the DAG and the GCS write step passed. No more 403s. Looks like `Storage Object Admin` on the bucket did the trick.
+[2026-07-15 09:20:12] lead_aman: Nice. Quick note: if you wire Pub/Sub into this later, remember to use `Pub/Sub Publisher` for anything pushing messages and `Pub/Sub Subscriber` for consumers. Keep everything aligned with least privilege.
+[2026-07-15 09:21:38] dev_rahul: Got it, thanks all. I’ll document the exact IAM roles (Composer Worker + bucket-level Storage Object Admin) in the DAG README so we don’t hit this again.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know which IAM roles we actually need to give the new ETL service account so it can read from Pub/Sub, write to BigQuery, and push logs to GCS without over-privileging it?
+[2026-07-16 09:05:09] lead_aman: Stick to least privilege. For Pub/Sub consumption it should just need `Pub/Sub Subscriber`, for writing to BQ tables `BigQuery Data Editor`, and if it has to run queries itself then `BigQuery Job User` as well.
+[2026-07-16 09:07:44] data_vishal: For GCS logs, don’t give it broad storage admin. `Storage Object Admin` is enough if it only needs to create/update/delete objects in that specific bucket.
+[2026-07-16 09:10:02] ops_priya: +1, and scope all of those roles at the narrowest resource level you can: topic/subscription for Pub/Sub, dataset for BigQuery, and just the logs bucket for Storage Object Admin. No project-wide bindings unless we really have to.
+[2026-07-16 09:12:37] sre_neha: Just to confirm: the Composer environment workers already have `Composer Worker` right? We shouldn’t reuse that for the ETL SA; better to keep this new SA separate with only `Pub/Sub Subscriber`, `BigQuery Data Editor`, `BigQuery Job User`, and `Storage Object Admin` on the specific resources.
+[2026-07-16 09:15:01] dev_rahul: Got it. So: Pub/Sub Subscriber on the input subscription, BigQuery Data Editor + Job User on the target dataset, Storage Object Admin on the logs bucket, all scoped as tightly as possible. No extra roles. I’ll wire that up now and test.
+[2026-07-16 09:18:26] dev_rahul: Just ran the pipeline end-to-end: it can pull messages, write to BQ, and upload logs to GCS. No permission errors and IAM looks minimal. Thanks all, this answers it.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone else noticing our nightly pipeline DAG is randomly slowing down? Duration almost doubled last night but I don't see any obvious errors in the logs.
+[2026-07-15 09:04:07] sre_neha: Checking Cloud Monitoring now. We do have a dashboard for the pipelines, right? It should show DAG duration and worker metrics.
+[2026-07-15 09:06:15] data_vishal: Yeah, the "ETL Pipelines" Cloud Monitoring dashboard tracks pipeline failures, worker CPU, memory, DAG duration, and failed jobs. Let me pull up last night's window.
+[2026-07-15 09:09:02] data_vishal: Okay, for the 2am run, DAG duration graph shows it went from ~25 mins to ~50 mins. Worker CPU stayed under 40%, but memory on worker-3 spiked close to the limit during that run.
+[2026-07-15 09:11:18] ops_priya: Do we see any increase in failed jobs on that dashboard around the same time? Sometimes retries can inflate DAG duration.
+[2026-07-15 09:13:44] sre_neha: Yup, the "Failed jobs" panel shows a bump: normally 0–1 per run, but last night there were 7 failed jobs that then retried successfully. No overall pipeline failure, but that explains the longer DAG duration.
+[2026-07-15 09:16:20] dev_rahul: That lines up with the task logs; I saw a few retry messages but didn’t realize how many. So we’re not CPU-bound, more like memory pressure causing intermittent failures?
+[2026-07-15 09:19:03] lead_aman: Exactly. Since Cloud Monitoring shows memory spikes on that specific worker and a correlated rise in failed jobs + DAG duration, we should tune that task’s memory usage or bump the worker’s memory. For now, can we set an alert on pipeline failures and a warning on elevated failed jobs?
+[2026-07-15 09:21:37] sre_neha: On it. I’ll add Cloud Monitoring alerts for: 1) any pipeline failure, and 2) failed jobs exceeding a small threshold per run. That way we catch it before DAG duration doubles again.
+[2026-07-15 09:24:10] data_vishal: I’ll optimize the heavy transform step and see if we can reduce memory per worker. Meanwhile, the Cloud Monitoring dashboard at least confirms the pipelines are succeeding, just slower, so we’re not in a broken state.
+[2026-07-15 09:26:55] lead_aman: Cool, let’s keep using that dashboard as our single place to watch pipeline failures, worker CPU/memory, DAG duration, and failed jobs. Rahul, if you see another spike tonight, grab a screenshot from Cloud Monitoring and we’ll compare.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know why our data pipeline issues aren’t obvious in Cloud Monitoring? I only see generic VM metrics, but not pipeline failures or DAG duration for the new GCP env.
+[2026-07-16 09:04:07] sre_neha: Checking now. On the main dashboard I only see worker CPU and memory charts, nothing about failed jobs or DAG duration. Did we ever add those to a custom dashboard?
+[2026-07-16 09:07:55] lead_aman: For GCP we’re supposed to rely on Cloud Monitoring dashboards for this. We need panels for: pipeline failures, worker CPU, memory, DAG duration, and failed jobs. Sounds like we only wired up CPU/memory so far.
+[2026-07-16 09:10:32] ops_priya: I’m in Cloud Monitoring → Dashboards → “data-pipeline-workers”. Confirmed: two charts only, `compute.googleapis.com/instance/cpu/utilization` and memory usage. No widgets for pipeline failures or job status.
+[2026-07-16 09:13:18] data_vishal: That explains why I missed last night’s DAG slowdown. CPU looked fine so I assumed all good. We should add a chart that tracks DAG duration and another that shows count of failed jobs / pipeline failures.
+[2026-07-16 09:16:40] sre_neha: +1. The doc for monitoring literally lists those: pipeline failures, worker CPU, memory, DAG duration, failed jobs. I’ll create a new “data-pipeline-overview” dashboard so it’s not buried under worker infra.
+[2026-07-16 09:19:27] dev_rahul: Nice. When you add DAG duration, can you also put a 30‑min rolling chart and a single‑value widget for “last DAG run duration”? That’ll make regressions easier to spot.
+[2026-07-16 09:22:51] sre_neha: Done: new Cloud Monitoring dashboard “data-pipeline-overview” with:
+[2026-07-16 09:25:03] data_vishal: Just checked, looks good. I can clearly see last night’s spike in DAG duration and the corresponding failed jobs panel lighting up. This is exactly what we needed.
+[2026-07-16 09:27:36] lead_aman: Great, let’s make this our primary Cloud Monitoring dashboard for pipelines. Rahul, does this resolve the visibility issue?
+[2026-07-16 09:29:10] dev_rahul: Yep, all good now. I’ve pinned the “data-pipeline-overview” dashboard and added a note to always watch pipeline failures + DAG duration, not just CPU/memory.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone else seeing our GCP worker just silently die on transient network blips? I'm not seeing retries or alerts when Pub/Sub acks fail intermittently.
+[2026-07-15 09:04:03] lead_aman: What does the log look like around the failure? Any stack trace or just the error message?
+[2026-07-15 09:05:47] dev_rahul: Here's a snippet from Stackdriver:
+[2026-07-15 09:08:12] sre_neha: That’s not aligned with our error-handling guidelines. For transient failures like `Unavailable`, we should always retry, log the full stack trace, send an alert, and keep the service up (fail gracefully). Sounds like we're not doing at least 3 of those.
+[2026-07-15 09:10:26] ops_priya: Checking the worker code now. In `handleMessage()`, we have:
+[2026-07-15 09:12:44] lead_aman: Yeah, that's pretty much the opposite of "fail gracefully". We should wrap that in a retry with backoff for transient errors, log `fmt.Printf("%+v", err)` or equivalent for a stack trace, and call our `notifyError(err)` so alerts fire.
+[2026-07-15 09:14:59] data_vishal: Also, for visibility, can we add a specific log like `"[RETRY] transient Pub/Sub failure, attempt=%d, err=%+v"`? That will help us confirm retries are actually happening when we analyze logs later.
+[2026-07-15 09:17:21] dev_rahul: Implemented a quick fix:
+[2026-07-15 09:19:48] sre_neha: Just tested in staging by forcing a fake `Unavailable` from Pub/Sub. Seeing:
+[2026-07-15 09:21:30] lead_aman: Perfect. Rahul, please open a small doc update referencing this worker as an example implementation of our error-handling rules, then we can roll this change to prod after lunch.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone remember what our standard is for handling errors in the new GCP ingestion service? I'm wiring up the pubsub consumer and not sure if I should just bubble exceptions up or swallow/requeue.
+[2026-07-16 09:04:03] lead_aman: For anything transient (network hiccups, brief GCP API issues), we always retry. Make sure you're not just swallowing exceptions though.
+[2026-07-16 09:06:12] sre_neha: +1 on retries. Also, don't forget we need full stack traces in the logs. We had a case last month where only the error message was logged and it was impossible to debug.
+[2026-07-16 09:08:27] dev_rahul: Got it. So pattern should be: catch transient errors, retry with backoff, and on final failure log the full stack trace. Do we also page on these or just rely on dashboards?
+[2026-07-16 09:11:10] ops_priya: We should send alerts when retries are exhausted or if we see repeated failures. Dashboards alone aren't enough; the on-call needs a signal when things keep breaking.
+[2026-07-16 09:13:44] lead_aman: Exactly. And make sure the service fails gracefully if it can't recover. No crashing the whole process because one message blew up — handle the error, log stack, alert, and move on where possible.
+[2026-07-16 09:16:02] data_vishal: For the data pipeline side, "fail gracefully" for us means we skip the bad record after logging and alerting, not halt the entire batch. Same principle should apply to your consumer.
+[2026-07-16 09:18:19] dev_rahul: Makes sense. So consolidated: retry transient failures, log stack traces, send alerts when retries are done, and keep the service running by handling the error cleanly. I'll update the handler accordingly.
+[2026-07-16 09:20:41] sre_neha: Perfect. Once you push, drop a note — I'll verify that the logs include stack traces and that alerts fire correctly when we simulate a persistent failure.
+[2026-07-16 09:23:05] dev_rahul: Patch is in and tested locally with a forced timeout: retries happen, stack trace is logged on final failure, and we surface an alert event without killing the worker. Looks aligned with our error-handling rules.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone seeing really slow queries on the new analytics dashboard? The main BigQuery job for daily metrics is taking ~4 mins instead of ~40s.
+[2026-07-15 09:04:03] data_vishal: Yeah, I just checked the job history. The big one is scanning ~1.2TB. The query has a `SELECT *` from the events table and no partition filter on `event_date` 😅
+[2026-07-15 09:06:45] lead_aman: If it's scanning that much, we probably skipped partitioning or clustering on the new table. Is `events_daily` actually partitioned by date in BigQuery?
+[2026-07-15 09:08:10] data_vishal: Looking now. Schema shows `event_date` as a normal DATE column, no partitioning. Also no clustering keys defined. So we're full-scanning and then grouping.
+[2026-07-15 09:10:27] ops_priya: That explains the cost spike alert I saw. Can we re-create as a partitioned table on `event_date` and maybe cluster on `user_id` or `country`? Also, we should drop the `SELECT *` and only pull the fields the dashboard actually needs.
+[2026-07-15 09:12:02] dev_rahul: +1. I'll update the query to explicitly select just `event_date, user_id, country, revenue` and add a `WHERE event_date BETWEEN @start AND @end`. Vishal, can you handle the table migration to a partitioned + clustered version?
+[2026-07-15 09:14:39] data_vishal: On it. I'll create `events_daily_p` partitioned on `event_date` and clustered by `user_id,country`, backfill last 90 days, then switch the dashboard to hit that. Should cut scan size drastically.
+[2026-07-15 09:17:21] sre_neha: Once that’s in, let’s also cap the default date range in the dashboard to 30 days so we don’t accidentally query the whole history. That, plus avoiding `SELECT *`, should keep performance stable.
+[2026-07-15 09:20:44] data_vishal: Migration done and dashboard query updated. New job scans ~45GB instead of 1.2TB, and runtime is ~32s consistently.
+[2026-07-15 09:22:10] dev_rahul: Just refreshed the dashboard a few times—latency looks good now and no more timeouts on the frontend. Calling this fixed.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone else seeing BigQuery costs spike on the daily session report? Query latency also jumped from ~12s to ~45s since yesterday.
+[2026-07-16 09:04:09] data_vishal: Yeah, I noticed in Looker the same explore is way slower. Do we know if the underlying table is partitioned/clustered or are we just scanning everything?
+[2026-07-16 09:06:55] dev_rahul: Query text from Looker is basically:
+[2026-07-16 09:09:27] lead_aman: That explains both cost and latency. We should:
+[2026-07-16 09:12:10] data_vishal: Just checked the table schema: it's a plain table, no partitioning, no clustering. We're scanning the whole thing every time. I'll recreate as a partitioned table on event_date and cluster by user_id + country.
+[2026-07-16 09:15:48] ops_priya: Once that’s in place, can we also update the Looker derived table to:
+[2026-07-16 09:19:37] data_vishal: New table created + backfilled. Ran the updated query:
+[2026-07-16 09:22:04] lead_aman: Nice. Let’s document: for BigQuery, always partition large tables, cluster where it helps, and avoid SELECT * in any production query. That should keep both performance and cost under control.
+[2026-07-16 09:24:51] dev_rahul: Confirmed from Looker side: dashboards are back to ~10–12s loads and cost per run dropped. Issue resolved.
+
+[2026-07-15 09:01:12] dev_rahul: Quick question on the new GCP microservice — is it okay if I just drop the DB password into an env var in the Dockerfile for now? CI is yelling at me about "credential in source" but I need to unblock myself.
+[2026-07-15 09:03:08] lead_aman: Please don’t put any credentials in source or in the Dockerfile. Our GCP guideline is explicit: never store credentials inside source code. What are you trying to access exactly?
+[2026-07-15 09:05:21] dev_rahul: It's the Postgres instance on GCP. Right now I have:
+[2026-07-15 09:07:44] sre_neha: For anything credential-like, we should be using Secret Manager + Service Accounts. App gets a service account, and that SA is granted IAM roles to access the secret. No passwords baked into images or code.
+[2026-07-15 09:10:02] ops_priya: Yep. Flow should be:
+[2026-07-15 09:12:37] data_vishal: Also remember to set a rotation policy on that DB secret. The doc says we must rotate keys regularly, so don’t treat this as a one-time set-and-forget.
+[2026-07-15 09:14:18] dev_rahul: Got it. So no credentials in Dockerfile, use Secret Manager + service account + IAM role, and set up rotation. I’ll strip the env vars from the Dockerfile and wire in Secret Manager instead.
+[2026-07-15 09:16:03] lead_aman: That’s the correct setup and aligned with our security guidelines. Once you push that change, the CI check for “credentials in source” should pass.
+[2026-07-15 09:17:45] dev_rahul: Just updated the PR: removed hardcoded envs, added Secret Manager integration, and documented the rotation schedule. CI is green now. Thanks all!
+
+[2026-07-16 09:02:11] dev_rahul: Quick question on GCP security: is it okay if I just drop the API key into the Node app’s config file for now and we move it to Secret Manager later?
+[2026-07-16 09:04:03] lead_aman: No, don’t put any credentials in source code at all, even “temporarily”. We need to use Secret Manager / service accounts / IAM roles per our GCP security guidelines.
+[2026-07-16 09:06:27] ops_priya: +1. If this is talking to a GCP service, prefer a service account with the right IAM role instead of a raw API key. Then the app just uses ADC and doesn’t need a key in config.
+[2026-07-16 09:08:10] dev_rahul: Got it. This is for calling another internal GCP service. So I should create a service account, give it the minimal IAM role, and then mount that into the runtime instead of an env var API key?
+[2026-07-16 09:11:22] sre_neha: Exactly. No hardcoded creds, no keys in env files committed to git. Use a service account with least-privilege IAM roles, and if you *do* end up with any keys, make sure they’re stored in Secret Manager and rotate them regularly.
+[2026-07-16 09:13:47] data_vishal: Also, if we already have a key lying around for that service, we should schedule a rotation. The security doc explicitly calls out rotating keys regularly, so let’s not keep any long-lived ones around.
+[2026-07-16 09:16:02] ops_priya: I can help wire this up: create `svc-internal-api` service account, assign the specific IAM role it needs, then update the deployment to use that SA instead of passing an API key. No code changes needed beyond removing any credential fields.
+[2026-07-16 09:18:40] dev_rahul: That works. I’ll strip the API key logic from the config and rely on the service account. For the one test key I generated earlier, I’ll put it in Secret Manager for now and then we can rotate/delete it.
+[2026-07-16 09:21:15] lead_aman: Perfect. To summarize: no credentials in source, use Secret Manager if we *must* store keys, prefer service accounts + IAM roles, and make sure we have a rotation plan for anything that still uses keys. That keeps us aligned with the security guidance.
+[2026-07-16 09:22:58] dev_rahul: Cool, thanks all. I’ll push the changes without any creds in the repo and ping once the service account wiring is done.
+
+[2026-07-15 09:02:11] dev_dan: Anyone know which service is supposed to be listening on port 8085? I'm trying to trace some third-party transaction calls and nothing is responding on that port in dev.
+[2026-07-15 09:04:07] dev_alice: 8085 should be the Payment Gateway microservice, the one that talks to Stripe and PayPal. Are you hitting it from your local or from another container?
+[2026-07-15 09:06:12] dev_dan: From my local. I'm calling `http://localhost:8085/health` and getting `ECONNREFUSED`. Also our checkout flow that goes through Stripe is failing with a generic 500 on the frontend.
+[2026-07-15 09:08:45] ops_bob: Let me check the dev cluster. Running `kubectl get pods -n payments`… I don't see any pod named like `payment-gateway` or similar. Maybe the deployment never got applied?
+[2026-07-15 09:10:33] lead_sam: For context, all third-party transaction processing (Stripe + PayPal) is supposed to be centralized in that Payment Gateway service on 8085, so if it's down, both providers will fail. Bob, can you check if the service object on 8085 exists?
+[2026-07-15 09:12:40] ops_bob: Yeah, `kubectl get svc -n payments` shows no service exposing 8085. Looks like dev env is missing the Payment Gateway deployment entirely. I'll apply the manifest now: `kubectl apply -f k8s/payment-gateway-dev.yaml`.
+[2026-07-15 09:15:27] ops_bob: Deployment created, pod is up and Running. Service `payment-gateway` is now bound to port 8085. Dan, can you retry your health check?
+[2026-07-15 09:17:02] dev_dan: Just hit `curl http://localhost:8085/health` via the port-forward and got `200 OK`. Also retried a Stripe test payment and it went through fine. So Payment Gateway on 8085 being missing was the root cause.
+[2026-07-15 09:18:36] qa_leah: Nice, I’ll re-run the regression suite for Stripe and PayPal flows to confirm. Since all third-party transactions go through that microservice, this should clear a bunch of failing tests.
+[2026-07-15 09:20:11] lead_sam: Good catch. Let’s add to the runbook: if Stripe/PayPal flows fail across the board, first verify the Payment Gateway microservice is running and exposed on port 8085 in that environment.
+
+[2026-07-16 09:02:11] dev_alice: Anyone know why the payment-gateway container is refusing connections on port 8085 in dev? The frontend is getting `ERR_CONNECTION_REFUSED` when trying to hit `/charge`.
+[2026-07-16 09:04:03] qa_leah: I’m seeing the same during smoke tests. The test harness tries `http://payment-gateway.dev.svc.cluster.local:8085/health` and just dies with `connect ECONNREFUSED 10.0.3.42:8085`.
+[2026-07-16 09:06:27] ops_bob: Checking the pod now. `kubectl get pods -n payments` shows `payment-gateway-7c9d8b7d5f-ktz9l` in Running. Let me exec in and see what’s actually listening.
+[2026-07-16 09:08:11] ops_bob: Inside the pod, `netstat -tulpn | grep 8085` returns nothing. So the Payment Gateway Microservice isn’t actually bound to port 8085 even though that’s what we expect per the docs.
+[2026-07-16 09:10:44] dev_dan: That’d explain it. The service is supposed to expose the Payment Gateway Microservice on 8085 for all third‑party transaction processing via Stripe and PayPal. What’s the container log say on startup?
+[2026-07-16 09:12:19] ops_bob: Logs show: `Starting payment-gateway on port 3000` 🤦 Looks like someone changed the default. So app is on 3000, but the k8s Service + readiness probe still point to 8085.
+[2026-07-16 09:14:02] lead_sam: Yeah, per our spec it must operate on port 8085 so other services can route correctly. Let’s flip the app config back to 8085 instead of hacking the Service.
+[2026-07-16 09:16:25] dev_alice: Updated the deployment env: `PAYMENT_GATEWAY_PORT=8085` and redeployed. New pod is up; `netstat` now shows `tcp 0 0 0.0.0.0:8085 LISTEN`. Health check on `/health` returns 200.
+[2026-07-16 09:18:03] qa_leah: Re-ran the smoke tests: Stripe and PayPal flows both pass, no more `ECONNREFUSED` on 8085. Looks fully wired again.
+[2026-07-16 09:19:41] lead_sam: Nice. Let’s add a quick note in the runbook that the Payment Gateway Microservice must always bind to 8085 so we don’t repeat this.
+
+[2026-07-15 09:02:11] dev_dan: Anyone seeing intermittent ERR_PAY_504s from the payment gateway on staging? I'm hitting the /v1/checkout endpoint and about 20% of requests come back with `{"error_code":"ERR_PAY_504","message":"Gateway timeout"}`.
+[2026-07-15 09:04:03] qa_leah: Yeah, my regression suite started flagging those this morning. Same ERR_PAY_504. From the docs I see that’s our gateway timeout when calling Stripe, with an internal limit of 15000ms. Not sure yet if it’s actually hitting that full 15s though.
+[2026-07-15 09:06:25] dev_alice: I just tailed the gateway logs in staging. For one failing request I see:
+[2026-07-15 09:08:47] ops_bob: Checking network metrics to Stripe from the staging cluster. RTT looks normal, but I do see a few spikes where outbound calls hang around ~14-15s. Could be Stripe sandbox being slow. Our code is doing the right thing per the spec: if Stripe doesn’t respond within 15000ms, we raise ERR_PAY_504.
+[2026-07-15 09:11:12] lead_sam: That lines up with the error definition in the payment_gateway doc: ERR_PAY_504 is strictly the gateway timeout when connecting to Stripe, with that 15000ms limit. As long as the client is getting that code, behavior is correct. We just need to confirm nothing else is misclassified (e.g., not confusing it with auth issues like ERR_PAY_401).
+[2026-07-15 09:13:20] dev_dan: Confirmed, I’m only seeing ERR_PAY_504 on the slow ones. When I intentionally omit `X-Gateway-Token`, I get `ERR_PAY_401` as expected, so the unauthorized path is fine. Sounds like this is just Stripe sandbox slowness and our gateway is enforcing the documented 15s timeout correctly.
+[2026-07-15 09:15:02] qa_leah: I’ll update the regression expectations to allow a small number of ERR_PAY_504s in staging, annotated as “Stripe sandbox latency / 15s gateway timeout as per spec”. No code change needed on our side.
+[2026-07-15 09:16:44] lead_sam: Perfect. Let’s also note in the test docs that ERR_PAY_504 is expected when Stripe takes >15000ms, so folks don’t chase this as a bug next time.
+
+[2026-07-16 09:02:11] dev_alice: Anyone know why we’re suddenly seeing `ERR_PAY_504` from the payment gateway in staging? It started popping up in the checkout flow after I bumped the Stripe client version in our service.
+[2026-07-16 09:04:07] qa_leah: I saw that in last night’s run too. About 3 out of 20 checkout tests failed with `ERR_PAY_504`. According to the docs, that’s our gateway timeout when connecting to Stripe, with a 15000ms limit.
+[2026-07-16 09:06:55] dev_dan: Pulling logs from staging now. Here’s one trace: `{"code":"ERR_PAY_504","message":"Stripe upstream timeout after 15000ms","path":"/v1/checkout"}`. So we’re definitely hitting that 15s internal timeout.
+[2026-07-16 09:09:42] ops_bob: Quick check on staging network to Stripe looks fine from my side: `curl https://api.stripe.com -w '%{time_total}\n' -o /dev/null -s` is around 0.4s consistently. So it’s not a general connectivity issue.
+[2026-07-16 09:12:18] lead_sam: Remember, `ERR_PAY_504` is raised strictly by the gateway when the Stripe call exceeds that 15000ms window. Alice, did the version bump change any default timeouts or add retries on your side that could be pushing us over 15s before the gateway gives up?
+[2026-07-16 09:15:39] dev_alice: Yeah, looks like the new Stripe client introduced automatic retries with backoff, and I mistakenly set `maxNetworkRetries=5` while leaving the gateway’s 15000ms limit unchanged. So our service might be still retrying while the gateway hits its 15s ceiling and returns `ERR_PAY_504`.
+[2026-07-16 09:18:03] dev_dan: That lines up with the traces: I see multiple outbound attempts to Stripe within a single request ID, then `ERR_PAY_504` exactly at 15000ms. I’d say reduce retries or align them with the gateway timeout.
+[2026-07-16 09:20:47] dev_alice: I’ll drop `maxNetworkRetries` to 1 for now and push a config-only change to staging so the Stripe call completes well under the 15s gateway timeout. Deploying in 5.
+[2026-07-16 09:24:16] qa_leah: Re-ran the checkout suite on staging after the config deploy: 30/30 passed, no `ERR_PAY_504` in the logs. Looks like we’re back within the 15000ms Stripe timeout window.
+[2026-07-16 09:26:02] lead_sam: Nice. Let’s document that `ERR_PAY_504` is tied to the fixed 15s Stripe connect timeout and that any client-side retries need to fit inside that. Alice, can you add a note to the payment_gateway error-handling section?
+
+[2026-07-15 09:02:11] dev_dan: Anyone know why our transaction states are disappearing from Redis after ~5 minutes in staging? The payment gateway microservice is complaining that it "lost transaction state before commit to Postgres."
+[2026-07-15 09:04:03] qa_leah: I saw that in last night's run. For long-running tests (~6 minutes), the flow fails with "transaction state not found in Redis, aborting commit to PostgreSQL". Shorter tests (<5 min) are fine.
+[2026-07-15 09:06:27] dev_alice: That sounds like the Redis TTL kicking in. The microservice uses Redis for transaction state before committing to Postgres, and the expiration is controlled via `REDIS_TTL_SECONDS`, default 300 seconds (5 min). Maybe staging is still on the default?
+[2026-07-15 09:08:10] ops_bob: Checking env vars on the staging deployment now. Running `kubectl get deploy payment-gateway -n staging -o yaml | grep REDIS_TTL_SECONDS -n5`.
+[2026-07-15 09:10:42] ops_bob: Here’s what I see in the pod spec:
+[2026-07-15 09:12:35] lead_sam: That explains it. For longer-running transaction flows, 300 seconds is too short. We should bump `REDIS_TTL_SECONDS` in staging to cover the longest expected transaction duration plus some buffer. Maybe 900 seconds (15 min) for now?
+[2026-07-15 09:14:01] dev_dan: 900s works for our current test suite; the slowest scenario is ~7 minutes. As long as Redis is just for temporary transaction state before Postgres commit, increasing TTL is safe capacity-wise for staging.
+[2026-07-15 09:16:22] ops_bob: Updating the staging deployment:
+[2026-07-15 09:19:03] qa_leah: Re-running the long-running test suite now. The one that usually fails at ~6:10 just passed. No more "transaction state not found in Redis" and the commit to PostgreSQL completed.
+[2026-07-15 09:21:18] lead_sam: Nice. Let's document that the Redis cache TTL is controlled by `REDIS_TTL_SECONDS` (default 300s) and must be set high enough so transaction state doesn't expire before the Postgres commit. Also good reminder that this microservice depends on Redis for pre-commit state.
+[2026-07-15 09:22:44] dev_alice: I’ll add a note to the deployment checklist so new environments don’t accidentally run with the 300s default when we know flows can exceed 5 minutes.
+
+[2026-07-16 09:02:11] dev_alice: Anyone know why some transactions are disappearing from the cache in staging before they get written to Postgres? I'm seeing gaps in transaction history even though the microservice reports "state committed" in logs.
+[2026-07-16 09:05:03] qa_leah: I noticed that in the last test run too. A few transactions never make it to Postgres, and the earlier log line shows `state=IN_REDIS` but no corresponding `state=PERSISTED`. Could this be related to our Redis TTL config?
+[2026-07-16 09:07:44] dev_dan: Could be. Remember the microservice uses Redis for transaction state before committing to PostgreSQL, and the expiration is controlled by `REDIS_TTL_SECONDS` (defaults to 300s). Maybe staging has a shorter TTL?
+[2026-07-16 09:10:12] ops_bob: Checking staging env vars now. Running `kubectl exec payment-gateway-staging-0 -- env | grep REDIS_TTL_SECONDS`…
+[2026-07-16 09:12:09] ops_bob: Here it is: `REDIS_TTL_SECONDS=60` in staging. So we overrode the default 300 seconds. If the commit path takes longer than a minute under load, the transaction state would expire from Redis before the service can move it to Postgres.
+[2026-07-16 09:15:21] lead_sam: That lines up with what we're seeing. The design assumes Redis holds transaction state long enough for the commit to PostgreSQL to complete, and the default 300s is our safety margin. Dropping it to 60s is probably too aggressive.
+[2026-07-16 09:18:02] dev_alice: Makes sense. I see a few slow commits in logs around 70–90 seconds under load tests. With `REDIS_TTL_SECONDS=60`, the state would be gone by then, so the service can't transition it to `PERSISTED`.
+[2026-07-16 09:20:45] ops_bob: I'll update the staging deployment to use the default. Setting `REDIS_TTL_SECONDS=300` in the Helm values and redeploying: `helm upgrade payment-gateway-staging ... --set env.REDIS_TTL_SECONDS=300`.
+[2026-07-16 09:24:39] qa_leah: I’ll rerun the regression suite once that’s up. Specifically watching the long-running transaction tests that were failing before.
+[2026-07-16 09:29:12] ops_bob: New pods are up. Confirmed via `kubectl exec ... env | grep REDIS_TTL_SECONDS` → `REDIS_TTL_SECONDS=300`.
+[2026-07-16 09:33:27] qa_leah: Regression just finished. All transactions now show `IN_REDIS` followed by `PERSISTED`, and they all appear in Postgres. No missing records. Looks like restoring `REDIS_TTL_SECONDS` to 300 seconds fixed it.
+[2026-07-16 09:35:48] lead_sam: Perfect. Let’s document that the Redis TTL should generally stay at the 300s default unless we explicitly re-evaluate the commit timing to Postgres.
+
+[2026-07-15 09:02:11] dev_alice: Anyone know why our payment API calls are hanging for ~30s and then failing from the client side? Frontend is just seeing generic timeouts when hitting the gateway.
+[2026-07-15 09:04:03] qa_leah: I saw that too in the last test run. Every call to `/payments/charge` from the test harness dies at ~30s. No explicit HTTP error, just a timeout in the client lib.
+[2026-07-15 09:06:27] dev_dan: That 30s smells like the API Gateway’s default downstream HTTP timeout. Remember the gateway is fronting all our payment microservices and has a 30s default for routing to them.
+[2026-07-15 09:08:10] ops_bob: Checking gateway logs now. I see entries like:
+[2026-07-15 09:10:22] lead_sam: That lines up with the architecture: API Gateway routes to the payment microservices and applies a 30s timeout on those HTTP calls. If the downstream service is slower than that, the gateway will terminate and the client just sees a timeout.
+[2026-07-15 09:12:01] dev_alice: Makes sense. So this isn’t a client bug, it’s the gateway enforcing its 30s limit. For now I’ll update the test expectations to treat ~30s timeouts as “gateway timeout” and I’ll add a note in the API docs that the gateway drops downstream calls after 30 seconds by design.
+[2026-07-15 09:14:36] lead_sam: 👍 Exactly. Document that the payment gateway is a microservices setup with the API Gateway in front, and that the 30s downstream HTTP timeout is the current default behavior. That should clear up confusion for anyone seeing these hangs.
+
+[2026-07-16 09:02:11] dev_alice: Anyone know what would cause some of our payment requests to hang for ~30s and then fail from the client side? Frontend is reporting a "network timeout" but backend pods look healthy.
+[2026-07-16 09:04:03] dev_dan: Checking API Gateway logs now. Given our gateway has a 30s default timeout for downstream HTTP calls, that 30s hang smells like the gateway cutting the connection to the client.
+[2026-07-16 09:07:12] ops_bob: Just pulled a snippet from the API Gateway logs for one of the reported request IDs:
+[2026-07-16 09:10:45] qa_leah: That lines up with what I see from the test harness: request goes out, no response body for ~30s, then the client surfaces a generic timeout. So the gateway is timing out on the downstream payment microservice, not the client timing out first.
+[2026-07-16 09:13:02] lead_sam: Right, per our architecture doc the API Gateway is the central router and has a hard 30s timeout for all downstream HTTP requests. If the payment microservice doesn't respond in under 30s, the gateway returns a 504-ish timeout to the caller. The client just shows it as "network timeout".
+[2026-07-16 09:16:27] dev_dan: So the behavior is expected given the config; the real issue is that the payment microservice is occasionally taking >30s. We can't change that 30s default without revisiting the architecture, so for now we should treat anything bumping into that limit as a performance bug in the downstream service.
+[2026-07-16 09:19:54] dev_alice: Got it. For this ticket I’ll document that the 30s cutoff is enforced by the API Gateway as part of the microservices setup, and that the "network timeout" the client sees is actually the gateway aborting a slow downstream call. I’ll open a separate perf issue for the payment service itself.
+[2026-07-16 09:22:18] lead_sam: Sounds good. As long as we reference in the ticket that the API Gateway is our core router with a 30s downstream HTTP timeout, that explains the timing pattern. Marking the original question as clarified/resolved.
+
+[2026-07-15 09:02:11] dev_alice: Anyone seeing a spike in `504 Gateway Timeout` from the payment verification service on staging? Started getting them intermittently when hitting the /verify endpoint.
+[2026-07-15 09:04:03] qa_leah: Yeah, my regression suite started failing about 10 mins ago. 6 out of 10 runs are returning 504s. Other endpoints look fine, just the transactional verification path.
+[2026-07-15 09:06:27] dev_dan: Checking logs now. From the payment service: `upstream timed out (110: Connection timed out) while connecting to upstream` and it mentions the Redis host that backs transactional verification.
+[2026-07-15 09:08:10] lead_sam: That Redis host should be the `payment-redis-cache` container. When that cache hangs or stops responding, our internal services bubble up 504s. Can someone confirm if that container is healthy on staging?
+[2026-07-15 09:09:55] ops_bob: On it. Running `docker ps | grep payment-redis-cache` on the staging host... container is up, but `docker logs payment-redis-cache --tail=20` is stuck, no new entries for ~15 minutes. Looks like it's hung.
+[2026-07-15 09:12:14] dev_alice: That lines up with when I first saw the timeouts. The cache is on the default Redis port 6379 with `allkeys-lru`, right? Anything in the metrics about memory pressure?
+[2026-07-15 09:14:22] ops_bob: Memory looks high but not maxed, nothing conclusive. Per our runbook, if `payment-redis-cache` is unresponsive we should do a hard restart. Executing: `docker restart payment-redis-cache` on staging now.
+[2026-07-15 09:17:03] ops_bob: Restart complete. Container came back up cleanly, seeing fresh logs and clients reconnecting. Port 6379 is listening as expected.
+[2026-07-15 09:18:41] qa_leah: Re-running the regression suite... all 10 runs passed, no more 504s. Latency on verification is back to normal.
+[2026-07-15 09:20:02] dev_dan: Manually hit /verify a few times as well, all 200s, no timeouts. Looks like the hung `payment-redis-cache` container was the culprit and the `docker restart payment-redis-cache` fixed it.
+[2026-07-15 09:21:36] lead_sam: Nice. Let’s add a note to the cache infra doc that 504s on transactional verification usually mean `payment-redis-cache` is stuck and the standard recovery is a hard restart via Docker.
+
+[2026-07-16 09:02:11] dev_alice: Anyone else seeing a spike in 504s from the payment gateway in staging? Checkout API is intermittently failing with `504 Gateway Timeout` since about 08:55.
+[2026-07-16 09:04:03] qa_leah: Yeah, my regression suite just blew up. 7 out of 10 transactional verification calls failed with 504. Prod looks fine, only staging is noisy.
+[2026-07-16 09:06:27] dev_dan: Looking at the internal logs from the verification service now. Getting repeated messages like: `upstream timeout while waiting for cache response` right before the 504s.
+[2026-07-16 09:08:12] lead_sam: That usually points at the Redis cache for payments. Remember we use the `payment-redis-cache` container on port 6379 with `allkeys-lru` as eviction. If that container hangs, the internal services bubble up 504s.
+[2026-07-16 09:10:21] ops_bob: Checking the container status: `docker ps | grep payment-redis-cache` shows it running, but `redis-cli -p 6379 ping` is just hanging, no `PONG`. Looks like it's unresponsive even though the container is up.
+[2026-07-16 09:12:44] lead_sam: In that case we follow the playbook: do a hard restart of the cache container. Use `docker restart payment-redis-cache` to bring it back; that’s the supported fix when it hangs.
+[2026-07-16 09:14:09] ops_bob: On it. Running `docker restart payment-redis-cache` in staging now… container stopped and started cleanly, logs show normal startup and binding to 6379.
+[2026-07-16 09:16:22] qa_leah: Re-ran the regression suite: all 10 verification calls passed, no more 504s. Latency is back to normal too.
+[2026-07-16 09:17:55] dev_alice: Confirmed from my side as well, manual checkout flow is succeeding consistently. Looks like the cache restart did the trick.
+[2026-07-16 09:19:30] lead_sam: Nice. Let’s note in the runbook that when we see payment 504s with cache timeouts, the first remediation is `docker restart payment-redis-cache` since that’s our official recovery step for a hung cache container.
+
+[2026-07-15 09:02:11] dev_sarah: Anyone know the right way to restart the cache on staging? Getting a bunch of 504s hitting the checkout flow.
+[2026-07-15 09:04:07] sre_priya: Is it specifically 504s from the gateway? Check logs for anything like ERR_PAY_504.
+[2026-07-15 09:05:55] dev_sarah: Yeah, logs show `ERR_PAY_504` on the staging gateway. Suspecting payment-redis-cache is hung again.
+[2026-07-15 09:07:12] ops_mike: First confirm Redis status on the staging box: `docker ps | grep payment-redis-cache` — see if it’s unhealthy or stuck.
+[2026-07-15 09:09:03] dev_sarah: Output shows `payment-redis-cache` with status `unhealthy (health: starting)` and it’s been like that for a few minutes.
+[2026-07-15 09:10:44] infra_kai: That’ll cause the 504s. To restart the staging cache, SSH into the staging host and run `docker restart payment-redis-cache`.
+[2026-07-15 09:12:02] dev_sarah: Already SSH’d in, just ran `docker restart payment-redis-cache` — container came back as `healthy` in `docker ps`.
+[2026-07-15 09:13:40] platform_raj: Nice. Hit the checkout endpoint again to confirm the ERR_PAY_504s are gone.
+[2026-07-15 09:15:21] dev_sarah: Retested: no more 504s, checkout is working fine now. So the canonical fix for staging cache issues is just `docker restart payment-redis-cache` on the staging box, right?
+[2026-07-15 09:16:58] sre_priya: Correct. On staging: verify with `docker ps`, and if `payment-redis-cache` looks bad, restart it with `docker restart payment-redis-cache`. That’s the supported path.
+
+[2026-07-16 09:02:11] dev_sarah: Anyone know the quickest way to restart the staging cache? I'm seeing a bunch of 504s on staging checkout and logs show `ERR_PAY_504` with mentions of `payment-redis-cache`.
+[2026-07-16 09:04:03] ops_mike: Checking if Redis is actually unhappy first. Running `docker ps` on the staging box now to see the status of `payment-redis-cache`.
+[2026-07-16 09:06:25] ops_mike: Yep, `payment-redis-cache` is showing as `unhealthy` in `docker ps`. That lines up with the 504s since the gateway times out when Redis hangs.
+[2026-07-16 09:08:10] infra_kai: For staging specifically, the restart procedure is simple: SSH into the staging host and run `docker restart payment-redis-cache`. That’s the canonical way we reset the staging cache.
+[2026-07-16 09:10:37] dev_sarah: Got it, SSH’d into the staging box and ran `docker restart payment-redis-cache`. Container is back up and `docker ps` shows it as `healthy` now.
+[2026-07-16 09:12:22] sre_priya: Nice. Give the gateway a minute to clear things out and then re-run a checkout flow. If the 504s stop, we’re good and we can note it as a cache hang incident.
+[2026-07-16 09:14:01] dev_sarah: Just re-ran checkout on staging: no more `ERR_PAY_504`, and latency looks normal again. Restarting `payment-redis-cache` via `docker restart payment-redis-cache` fixed it.
+
+[2026-07-15 09:02:11] dev_rahul: Morning folks, quick GCP BigQuery question: we're seeing some cost spikes on a couple of analytics queries. Any recommended patterns to optimize query performance / cost on large tables?
+[2026-07-15 09:04:03] lead_aman: For BigQuery, the main levers are table design + query shape. Are those big fact tables partitioned or just flat?
+[2026-07-15 09:06:12] dev_rahul: The main one (`events_raw`) is a single large table, no partitioning or clustering. Queries often do `SELECT *` filtered by a date range in a WHERE clause.
+[2026-07-15 09:08:20] sre_neha: That explains a lot of the cost. We should:
+[2026-07-15 09:10:07] data_vishal: +1. If you partition by `event_date`, queries like:
+[2026-07-15 09:12:45] ops_priya: Also check if any dashboards are doing unbounded queries (no filter on the partition column). Even with partitioned tables, if you don't filter on the partition field, BigQuery ends up scanning all partitions.
+[2026-07-15 09:15:02] dev_rahul: Got it. So action items: migrate `events_raw` to a partitioned table on `event_date`, add clustering on `user_id` + maybe `event_type`, and update queries to explicitly select needed columns and always filter on `event_date`. Anything else?
+[2026-07-15 09:17:11] lead_aman: That’s the core recipe. Partitioned tables + clustered tables + no `SELECT *` + filters on the partition column. Once that’s in place, we can re-check query stats, but this should significantly cut both scan bytes and latency.
+[2026-07-15 09:19:26] dev_rahul: Perfect, I’ll refactor the schema + key queries this sprint and monitor the slot usage. Thanks all.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone got a quick sanity check for me? I'm trying to optimize a really slow BigQuery query and wondering what the best-practice knobs are that we officially recommend.
+[2026-07-16 09:04:03] lead_aman: What does the query look like roughly? And how big is the table?
+[2026-07-16 09:05:27] dev_rahul: It's hitting our events table, ~2TB. Right now the query is basically:
+[2026-07-16 09:07:42] data_vishal: First thing: avoid `SELECT *` in BigQuery. Only pull the columns you actually need, otherwise you're scanning the entire row for every record.
+[2026-07-16 09:09:10] sre_neha: +1, and make sure the table is partitioned and clustered properly. We should be using partitioned tables and clustering keys so we don't scan the full 2TB every time.
+[2026-07-16 09:10:58] ops_priya: Also, make sure your filters actually hit the partition column. If the table is partitioned on, say, `event_date`, you want a `WHERE event_date BETWEEN ...` or similar so BigQuery can prune partitions.
+[2026-07-16 09:13:21] lead_aman: So the checklist from our GCP FAQ is: use partitioned tables, use clustered tables, avoid `SELECT *`, and always filter on the partition columns so the partitioning actually helps. If you do those, the query cost and latency drop a lot.
+[2026-07-16 09:15:02] dev_rahul: Got it. I'll add a date partition filter, define a cluster on `user_id`, and switch to only the 5 columns I need instead of `*`. That lines up with the FAQ, thanks all.
+[2026-07-16 09:16:44] data_vishal: Cool, once you push that change, grab the "bytes processed" from the BigQuery UI before/after. That'll be a good validation that the partitioning + clustering + no-`SELECT *` combo is working.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone seen our GCP Spark job on the nightly pipeline dying with `java.lang.OutOfMemoryError: Java heap space` on the executors? Started happening after we added a couple of joins yesterday.
+[2026-07-15 09:04:03] sre_neha: Yeah, I see the failures in the logs. Executors are getting killed during the big shuffle stage. The driver is fine, it's only the executors that OOM.
+[2026-07-15 09:06:27] lead_aman: If it's executor-side OOM, first lever is bumping executor memory. What are we currently requesting in the cluster config?
+[2026-07-15 09:08:10] ops_priya: Right now the Dataproc job template has `spark.executor.memory=4g` and `spark.executor.instances=10`. No explicit `spark.memory.fraction` overrides.
+[2026-07-15 09:10:45] data_vishal: Beyond just memory, the new joins might be causing heavy shuffle. Can we cut down shuffle ops? For example, avoid unnecessary repartitions or wide groupBy + join combos, maybe combine a couple of transformations before writing?
+[2026-07-15 09:13:02] dev_rahul: That makes sense. We also added a `.cache()` on an intermediate DataFrame used only once. Probably not needed and just bloating executor memory.
+[2026-07-15 09:15:36] lead_aman: Let's do three things: 1) increase `spark.executor.memory` from 4g to 8g, 2) remove that unnecessary cache, 3) review the pipeline to reduce redundant shuffles (e.g., drop extra `repartition(200)` we added for debugging).
+[2026-07-15 09:18:11] ops_priya: Updated job config: `spark.executor.memory=8g`, left instances at 10. Also pushed Rahul's code change removing the cache and the extra repartition before the big join. Kicking off a test run now.
+[2026-07-15 09:21:47] sre_neha: Watching the job in the console—shuffle-heavy stage just finished without any OOMs. Executor memory is peaking around 6.2G, so we’ve got headroom.
+[2026-07-15 09:24:03] data_vishal: Overall runtime looks similar, maybe slightly better. No `OutOfMemoryError` in the logs. So the combo of more executor memory + fewer shuffles + dropping the unnecessary cached DataFrame did the trick.
+[2026-07-15 09:26:29] lead_aman: Nice. Let’s document: for similar OOMs on GCP Spark, first step is to increase executor memory, reduce shuffle operations where possible, and avoid caching DataFrames that aren’t reused.
+
+[2026-07-16 09:01:12] dev_rahul: Anyone seen our GCP Dataproc Spark job randomly dying with `java.lang.OutOfMemoryError: Java heap space` on the executors? It’s the nightly aggregation pipeline.
+[2026-07-16 09:03:47] lead_aman: Where exactly is it failing, Rahul? Shuffle, join, or some wide transformation? Any snippet from the driver logs?
+[2026-07-16 09:06:15] dev_rahul: From the driver logs:
+[2026-07-16 09:09:32] sre_neha: If it’s heap OOM on executors, first step is to bump executor memory. What are we currently using for `--executor-memory` and `--executor-cores`?
+[2026-07-16 09:12:08] dev_rahul: Current config:
+[2026-07-16 09:15:44] data_vishal: 4G with multiple cached DataFrames + heavy shuffle is tight. We should increase executor memory and also cut down shuffle. That join + `groupBy` combo is likely creating huge shuffle blocks.
+[2026-07-16 09:18:02] ops_priya: +1. From the monitoring side, I see executor heap consistently at ~95% before they die. Can we:
+[2026-07-16 09:21:27] dev_rahul: I can drop cache on one of the intermediate DataFrames that’s only used once, and maybe refactor one `groupBy` + `join` into a single aggregation. I’ll also bump executors to:
+[2026-07-16 09:25:03] lead_aman: That aligns with best practices: more executor memory, fewer shuffle-heavy ops, and avoid caching DataFrames you don’t reuse. Kick off a test run with those changes and share the outcome.
+[2026-07-16 09:30:11] dev_rahul: Test run finished: no `OutOfMemoryError`, all executors stayed healthy, job duration dropped from 42 min to 35 min. Looks like increasing executor memory + reducing shuffle + un-caching the extra DataFrame fixed it.
+[2026-07-16 09:32:45] sre_neha: Nice. Let’s promote those settings to the nightly job and note in the runbook: for OOM on Spark executors, first try increasing executor memory, reducing shuffle ops, and not caching unnecessary DataFrames.
+
+[2026-07-15 09:02:11] dev_rahul: Quick GCP question: for our new consumer, when exactly are we supposed to ack Pub/Sub messages? Right after we pull them or after we finish processing?
+[2026-07-15 09:04:03] lead_aman: For our patterns, you should only acknowledge Pub/Sub messages after they’ve been processed successfully, not when they’re received.
+[2026-07-15 09:06:12] sre_neha: +1, ack is our signal to Pub/Sub that we’re done with the message. If we ack before the work completes and then we fail, Pub/Sub won’t redeliver it.
+[2026-07-15 09:08:45] ops_priya: So the flow should be something like: receive → process → on success call `ack()`; on failure don’t ack so it gets redelivered after the ack deadline, right?
+[2026-07-15 09:10:27] lead_aman: Exactly. “Always acknowledge the message after successful processing” is the rule. If processing fails, either let it time out or explicitly `nack`/modify deadline depending on the library, but never ack on failure.
+[2026-07-15 09:13:05] data_vishal: Got it. I’ll update the consumer so the ack is the very last step and only runs if all downstream calls and DB writes succeed.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know our standard for when to ack GCP Pub/Sub messages in the worker? I see a few places where we ack as soon as we receive, others after processing.
+[2026-07-16 09:04:03] lead_aman: For our services, we should only be acknowledging after the message has been processed successfully. Acknowledge-on-receive is risky.
+[2026-07-16 09:06:27] sre_neha: +1, from the GCP FAQ we documented: always ack the Pub/Sub message after successful processing, not before.
+[2026-07-16 09:08:10] dev_rahul: Got it. Then this code is wrong, right?
+[2026-07-16 09:10:42] lead_aman: Exactly. Pattern should be:
+[2026-07-16 09:13:05] ops_priya: Just to confirm, this is also what we rely on for retries. If processing fails and we don't ack, Pub/Sub will redeliver, which is what we want.
+[2026-07-16 09:15:19] data_vishal: Makes sense. For idempotent consumers, delayed ack is fine and preferred. Early ack would break our ability to reprocess failed events.
+[2026-07-16 09:17:02] dev_rahul: Perfect, thanks all. I’ll update the worker to only acknowledge after successful processing and push a PR.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone else seeing our GCP bill spike? BigQuery line item for the analytics project almost doubled this week and product is asking how we can reduce costs there.
+[2026-07-15 09:04:09] lead_aman: Yeah, I saw the report. Before we dig into usage patterns, there are a few standard levers on BigQuery cost: don’t do SELECT *, only query the columns you need, and make sure large tables are partitioned and clustered properly.
+[2026-07-15 09:06:02] data_vishal: +1. I checked one of the dashboards yesterday and found queries like:
+[2026-07-15 09:08:45] sre_neha: If we’re scanning that many bytes per query, it adds up fast. For the events table, can we explicitly list columns? Something like:
+[2026-07-15 09:11:27] ops_priya: Also, is `analytics.events` even partitioned? For large tables we should partition, usually on a date column, and then cluster on columns we filter a lot (e.g., `event_name`, `country`). That way, we don’t scan unnecessary partitions and clustering helps prune data further.
+[2026-07-15 09:14:39] data_vishal: Just checked the schema: it’s currently an unpartitioned heap table. I’ll recreate it as a partitioned table on `event_date` and add clustering on `event_name, country` since those show up in almost every WHERE clause.
+[2026-07-15 09:17:03] lead_aman: Perfect. Let’s also send a quick note to the analytics team: avoid SELECT *, always specify just the columns needed, and for any new large tables they create, default to partitioning + clustering on the most commonly filtered columns.
+[2026-07-15 09:19:41] dev_rahul: Sounds good. I’ll refactor the worst offending queries in the dashboards to only select required columns and rely on the new partitioned+clustered table once Vishal’s change is live. That should bring the BigQuery costs back under control.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know quick wins to bring down our BigQuery bill for the analytics project? Finance pinged me about last month’s spike.
+[2026-07-16 09:04:03] lead_aman: Yeah, we probably need to tighten up how we query. First thing: are we still doing `SELECT *` in the dashboards?
+[2026-07-16 09:05:47] dev_rahul: Unfortunately yes 🙈 A bunch of Looker explores and some ad-hoc queries are literally `SELECT * FROM big_dataset.events` with filters in WHERE.
+[2026-07-16 09:08:12] data_vishal: That’ll burn through bytes fast. We should only select the columns we actually need. For most dashboards it’s like 6–8 fields, not the 80 we have in that table.
+[2026-07-16 09:10:26] sre_neha: +1. Also, is that `events` table partitioned? If not, we’re scanning the full table on every query, which is $$$.
+[2026-07-16 09:12:39] ops_priya: Just checked the schema in the console. `events` is currently an unpartitioned, flat table, ~3TB. Most of our filters are on `event_date` and `customer_id`.
+[2026-07-16 09:15:21] lead_aman: Then we should: (1) partition on `event_date` so queries only read relevant days, and (2) cluster on a frequently filtered column, probably `customer_id`, to reduce scanned data further.
+[2026-07-16 09:17:54] data_vishal: Agreed. Short-term: I’ll update the main queries to avoid `SELECT *` and only pull required columns. Longer-term: we’ll create a partitioned+clustered version of `events` and point dashboards to that.
+[2026-07-16 09:20:02] dev_rahul: Sounds good. I’ll refactor the Looker views to use explicit column lists and switch them to the new partitioned/clustered table once it’s ready.
+[2026-07-16 09:22:37] ops_priya: I’ll handle the table migration: create `events_optimized` partitioned by `event_date`, clustered by `customer_id`, backfill, then we can cut over. That should noticeably drop query costs.
+[2026-07-16 09:25:10] lead_aman: Perfect. So our BigQuery cost strategy: no `SELECT *`, only query needed columns, partition large tables, and cluster on the columns we filter on most. Let’s monitor costs next week and confirm the drop.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone remember what we're supposed to use for joins when one of the DataFrames is tiny in our GCP Spark jobs? I'm trying to optimize a pipeline and wondering if there's a recommended pattern.
+[2026-07-15 09:04:03] lead_aman: For the case where one side is small, we standardize on broadcast joins. That helps avoid the big shuffle across the cluster.
+[2026-07-15 09:05:27] dev_rahul: Got it. So for my lookup table (~50k rows) joining with a 200M row fact table, I should broadcast the lookup, right?
+[2026-07-15 09:07:10] data_vishal: Yep, exactly. Treat the 50k-row DF as the small one and use a broadcast join so it gets sent to all executors instead of shuffling the big table.
+[2026-07-15 09:09:32] sre_neha: Just to be explicit, the idea is: "Use Broadcast Join when one DataFrame is small to reduce shuffle." That’s the guideline we documented for the GCP jobs.
+[2026-07-15 09:11:05] dev_rahul: Perfect, that’s what I needed. I’ll switch this join to broadcast on the small DF and rerun the job.
+[2026-07-15 09:13:22] ops_priya: Once you change it, keep an eye on the job duration in the next run. We usually see a noticeable drop in stage time when the shuffle is avoided.
+[2026-07-15 09:15:10] dev_rahul: Job finished, stage times look much better. Thanks all, sticking with broadcast join for this pattern.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone remember what join strategy we’re supposed to use in GCP Dataproc when one of the DataFrames is tiny? I vaguely recall something about “rk joins?” from the FAQ but I can’t find the doc.
+[2026-07-16 09:04:03] data_vishal: Yeah that “rk joins?” thing in the FAQ is just referring to broadcast joins. If one side is small, we should broadcast it instead of doing a regular shuffle join.
+[2026-07-16 09:06:27] dev_rahul: Got it. So for our case, we’ve got a ~5k-row lookup table joining with a 200M-row events table. So we should broadcast the lookup, right?
+[2026-07-16 09:08:55] data_vishal: Exactly. That’s the ideal case for a broadcast join. In Spark terms on Dataproc, just do something like:
+[2026-07-16 09:11:02] sre_neha: Just to confirm, the FAQ for GCP says: use a Broadcast Join when one DataFrame is small to reduce shuffle. So that’s aligned with what Vishal said.
+[2026-07-16 09:13:19] dev_rahul: Perfect. I’ll switch it to `broadcast(dim_lookup)` and re-run the job. It was spending ages in shuffle before.
+[2026-07-16 09:16:44] ops_priya: Once you change it, keep an eye on the Dataproc job UI – the shuffle read/write metrics should drop significantly if the broadcast join is being used.
+[2026-07-16 09:19:28] dev_rahul: Re-ran with the broadcast join. Shuffle read went from ~120GB to almost nothing, and the stage time dropped by ~60%. Looks like that was the fix.
+[2026-07-16 09:21:10] lead_aman: Nice. Let’s add a short note in our internal GCP runbook: “When one DF is small, use broadcast join to cut down shuffle,” and link it back to that FAQ entry so people don’t get confused by “rk joins?” again.
+[2026-07-16 09:23:47] dev_rahul: Done, updated the runbook with the broadcast join tip and reference to the FAQ. Issue resolved.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone seeing an issue with the GCP Airflow DAG `daily_gcs_to_bq`? It's been stuck in "retry" state for the last ~40 mins, no progress.
+[2026-07-15 09:04:03] sre_neha: Yeah I noticed a few alerts on that. Are the individual tasks actually rerunning or just sitting in "up for retry"?
+[2026-07-15 09:06:27] dev_rahul: They’re all "up_for_retry" with next try times in the past, but nothing is moving. Last log line on one of the tasks is just the standard "Starting attempt 2 of 3" and then nothing.
+[2026-07-15 09:08:15] ops_priya: Can you paste a snippet from the task logs? Especially around any external calls (GCS/BQ/API).
+[2026-07-15 09:10:42] dev_rahul: From `load_to_bq` task:
+[2026-07-15 09:13:01] sre_neha: That 503 + metadata error usually means the external service or the metadata server was flaky. First step: can you confirm BigQuery is reachable now from the worker? Maybe just run a quick `bq ls` from the Airflow worker pod.
+[2026-07-15 09:15:44] ops_priya: I just checked from a worker: `bq ls our_project:our_dataset` works fine now. Also verified GCS access with `gsutil ls gs://our-bucket` — no issues. So external connections look healthy at the moment.
+[2026-07-15 09:18:29] data_vishal: If external services are fine, we should look at the scheduler. The DAG being stuck in retry with past `next_retry` timestamps often means the scheduler isn’t picking them up. Is the Airflow scheduler process healthy?
+[2026-07-15 09:20:37] sre_neha: Just checked the scheduler pod logs — it was throwing heartbeat missed warnings earlier and then basically went quiet ~45 mins ago. The pod is still up but not processing. I’m going to restart the scheduler deployment.
+[2026-07-15 09:23:12] sre_neha: Scheduler restarted cleanly, heartbeats look normal now. The `daily_gcs_to_bq` tasks just moved from "up_for_retry" to "queued" and I see workers picking them up. Logs show the BigQuery load running without errors.
+[2026-07-15 09:25:08] lead_aman: Nice. So root cause: DAG stuck in retry because scheduler was unhealthy + earlier transient BQ/metadata 503. We’ve now checked task logs, confirmed external connections are OK, ensured GCS/BQ are up, and fixed scheduler health via restart. Let’s add a quick runbook note: when a DAG is stuck in retry, always check task logs, external services, and scheduler status in that order.
+[2026-07-15 09:27:36] dev_rahul: Confirmed from UI: DAG run finished successfully after the restart. I’ll document this in the Airflow FAQ.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone seen Airflow DAGs getting stuck in retry state on our GCP composer env? My `daily_etl_sync` DAG has 3 tasks that have been "retrying" for ~40 mins but the retry countdown isn't decreasing.
+[2026-07-16 09:04:37] sre_neha: Looking now. Do you have a task_id and execution_date for one of the stuck ones? I'll pull logs from the worker.
+[2026-07-16 09:06:02] dev_rahul: Example: DAG `daily_etl_sync`, task `fetch_source_data`, run_date `2026-07-16T00:00:00`. UI shows state "up_for_retry", next retry in 5m, but it's been that way since 08:20.
+[2026-07-16 09:08:55] ops_priya: I’m in the task logs from the web UI. Last lines are:
+[2026-07-16 09:11:12] sre_neha: That matches a stuck retry. First thing: we should verify the external connection that task is hitting. Do you know which connection ID it uses? Also, can you curl/ping that service from a bastion or Cloud Shell?
+[2026-07-16 09:13:44] dev_rahul: It’s using our `external_api_conn`. I just tried from Cloud Shell:
+[2026-07-16 09:16:09] ops_priya: Yeah, that would explain the initial failure, but the tasks should still move through retries. Let me double-check if all the required services on our side are running. Airflow scheduler looks suspiciously quiet. Running:
+[2026-07-16 09:18:27] sre_neha: So we have two issues: external service unreachable + scheduler not healthy. Per our GCP Airflow FAQ, when DAGs get stuck in retry, we should: check task logs (we did), verify external connections (we did, it's failing), ensure required services are running, and inspect scheduler health. Right now scheduler is clearly unhappy; I’ll restart it:
+[2026-07-16 09:21:54] data_vishal: I just got a ping from the external team: they restarted their API and `/health` is now returning 200 from my side. So external dependency is back. Once the scheduler is healthy, the retries should actually fire.
+[2026-07-16 09:24:33] sre_neha: Scheduler restart completed, logs now show:
+[2026-07-16 09:27:01] dev_rahul: Confirmed on my end: all three tasks that were stuck are now in `success` and the DAG run finished. Root cause: external API down + scheduler in bad state. Fix was: check logs, verify external connection, bring external service back, and restart the scheduler so retries could actually execute.
+[2026-07-16 09:29:18] lead_aman: Nice work closing the loop. Rahul, can you add a short note to the Airflow runbook under "DAG stuck in retry" to follow exactly those steps: inspect task logs, validate external services, confirm all Airflow components (esp. scheduler) are healthy?
+
+[2026-07-15 09:02:11] dev_rahul: Anyone know why our app can't connect to the GCP Cloud SQL instance from the new service pod? Getting generic connection refused from the client.
+[2026-07-15 09:03:47] sre_neha: Checking now. Are we using the Cloud SQL Auth Proxy sidecar on that deployment or connecting directly via public IP?
+[2026-07-15 09:05:12] dev_rahul: Using the Cloud SQL Proxy sidecar, same as other services. But logs show this on startup:
+[2026-07-15 09:07:59] ops_priya: First thing: can you confirm the proxy container is actually running and healthy in that pod? Maybe it crashed. `kubectl describe pod` or `kubectl logs <pod> -c cloud-sql-proxy`?
+[2026-07-15 09:09:44] dev_rahul: Just checked. Proxy container is in CrashLoopBackOff. Logs show:
+[2026-07-15 09:12:03] lead_aman: That lines up with the usual suspects: IAM + firewall. Make sure the service account used by the proxy has the right IAM role for Cloud SQL, and that the instance firewall/network rules allow connections from where this is running.
+[2026-07-15 09:13:55] data_vishal: +1. Also verify the Cloud SQL Proxy itself is configured correctly in the manifest. But given that permission error, I'd start with IAM: does the k8s service account map to a GCP SA that has Cloud SQL Client?
+[2026-07-15 09:16:21] dev_rahul: Found the issue: the new namespace is using a different GCP service account without `Cloud SQL Client` role. I just added that role and restarted the pod. Proxy is now running without errors.
+[2026-07-15 09:18:02] sre_neha: Nice. Can you also confirm firewall/network allows it? If it's private IP, check the VPC/subnet; if it's public, confirm the authorized network or that you're going through the proxy correctly.
+[2026-07-15 09:20:27] dev_rahul: Verified: instance is using private IP, same VPC as the cluster, no extra firewall block. After the IAM fix and proxy restart, app can connect and queries are succeeding.
+[2026-07-15 09:21:58] lead_aman: Perfect. Summarizing: issue was Cloud SQL Proxy running with a service account missing the needed IAM permissions. Fix was to ensure the proxy is up and then grant the right IAM role and confirm firewall/VPC access.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know why my app on GKE can’t reach Cloud SQL this morning? Getting `dial tcp 10.0.0.5:5432: i/o timeout` from the service logs.
+[2026-07-16 09:04:09] sre_neha: First thing to check: is the Cloud SQL Proxy actually running in that namespace? `kubectl get pods -n <ns> | grep sql-proxy` shows anything?
+[2026-07-16 09:06:45] dev_rahul: Just checked, the sql-proxy sidecar isn’t there on the latest deployment. Only the app container. I assumed direct connection would work.
+[2026-07-16 09:08:57] lead_aman: For our setup we always go through Cloud SQL Proxy, not direct IP. You’ll need the proxy container in the pod spec, and the app should connect to `127.0.0.1:<proxy-port>` instead of the private IP.
+[2026-07-16 09:11:22] ops_priya: Also, when you add the proxy back, make sure the service account on that pod has IAM `Cloud SQL Client` role. If IAM is missing, proxy will start but fail auth to the instance.
+[2026-07-16 09:13:40] data_vishal: And don’t forget firewall: if you ever switch to direct connection, the VPC firewall needs to allow the GKE node IP range to hit the Cloud SQL instance. But with the proxy, the main checks are: proxy running + IAM correct.
+[2026-07-16 09:16:03] dev_rahul: Got it. I’ve re-added the Cloud SQL Proxy sidecar, pointed the app to `localhost:5432`, and verified the pod’s service account has `roles/cloudsql.client`. No custom firewall rules needed in this path, right?
+[2026-07-16 09:18:27] sre_neha: Correct, for proxy-based access we just rely on IAM and the proxy itself. Firewall mainly matters for direct IP or public connections. If the pod is `Running` and proxy logs show successful connection, you should be good.
+[2026-07-16 09:20:15] dev_rahul: Logs look clean now: `Connected to Cloud SQL instance` in the proxy, and the app can run migrations. Connection issue resolved. Thanks all!
+
+[2026-07-15 09:02:11] dev_rahul: Quick GCP Dataproc question — what are we recommending for Spark executor memory these days? I’m setting up a new job and don’t want to overshoot.
+[2026-07-15 09:04:03] lead_aman: For most of our workloads we start with a standard baseline. Check the internal FAQ for the exact number, but it’s a single config on `spark.executor.memory`.
+[2026-07-15 09:06:12] data_vishal: Yeah, I’m looking at the FAQ now. For new pipelines we usually set `spark.executor.memory` to a fixed starting value and then tune up/down depending on the job characteristics.
+[2026-07-15 09:08:27] sre_neha: Confirming: the FAQ explicitly calls out a “common starting point” value for that setting, and notes that we tweak it based on workload behavior (GC, shuffle size, etc.).
+[2026-07-15 09:10:09] ops_priya: Just pulled up `data/faqs/gcp.md` → Topic 8. It says the recommended starting point is:
+[2026-07-15 09:12:21] dev_rahul: Perfect, that’s what I needed. I’ll start with `spark.executor.memory=8g` and monitor, then bump if we see OOMs or heavy GC.
+
+[2026-07-16 09:02:11] dev_rahul: Quick GCP Dataproc question — what are we recommending as the default Spark executor memory for new jobs? I see a few configs with 4g and some with 16g in different projects.
+[2026-07-16 09:04:03] lead_aman: For our standard guidance, we do have a baseline. Check the internal FAQ for GCP Spark tuning — it should call out a default executor memory value.
+[2026-07-16 09:06:25] data_vishal: Looking at the FAQ now. Under Spark config recommendations, it mentions a common starting point for executor memory.
+[2026-07-16 09:08:10] data_vishal: Found it: the doc says the recommended starting value is `spark.executor.memory=8g`, and then to tune up or down depending on the workload characteristics.
+[2026-07-16 09:10:32] sre_neha: +1, stick to `8g` as the default. We’ve had fewer OOMs and better cluster utilization with that as a baseline versus 4g or 16g.
+[2026-07-16 09:12:18] ops_priya: So just to confirm, for new Dataproc jobs we’ll set `spark.executor.memory=8g` in the default template and let teams override if their workload needs more/less?
+[2026-07-16 09:13:57] lead_aman: Yes, that matches the FAQ: use `8g` as the common starting point, and adjust per workload. Rahul, update any new job configs to use 8g unless there’s a strong reason not to.
+[2026-07-16 09:15:40] dev_rahul: Got it, I’ll standardize on `spark.executor.memory=8g` for the new pipelines and document that it’s just a baseline to be tuned.
+
+[2026-07-15 09:02:11] dev_rahul: Folks, quick GCP question: how are we *supposed* to organize our GCS buckets for the new pipeline? PM is asking for a "standard layout" and I don't want to improvise something random.
+[2026-07-15 09:04:03] lead_aman: For our standard, we don’t split into tons of buckets per stage. We use a single bucket (per domain/env) and standard prefixes. The expected structure is basically four top-level folders.
+[2026-07-15 09:05:27] ops_priya: +1, that’s what we used for the last project. The canonical layout is:
+[2026-07-15 09:07:10] data_vishal: To make it concrete for the new analytics project, I’d name the bucket something like `analytics-prod-data` and then inside:
+[2026-07-15 09:09:22] sre_neha: Also, from infra side, we can attach different lifecycle rules per prefix (e.g. auto-move from `landing/` to `archive/` after X days), but the key is we *always* use those four folders as the base structure.
+[2026-07-15 09:11:08] dev_rahul: Perfect, that’s exactly what I needed. I’ll set up one bucket per env and use `landing/`, `raw/`, `processed/`, `archive/` as the top-level prefixes and document it in the README.
+
+[2026-07-16 09:02:11] dev_rahul: Quick question on our GCP setup: how are we supposed to organize the GCS buckets for the new data pipeline? I vaguely remember something about different folders but not sure of the exact structure.
+[2026-07-16 09:04:39] data_vishal: Yeah, there's a recommended convention. We don't create separate buckets per stage; we use folders inside the bucket for the different zones.
+[2026-07-16 09:07:12] dev_rahul: Got it. Do you remember the exact folder names we standardized on? I see `tmp/` and `staging/` in one of the older buckets, but I’m not sure if that’s legacy.
+[2026-07-16 09:09:45] lead_aman: The legacy `tmp/` and `staging/` are from an older pattern, don’t copy that. The current guideline is to organize with four top-level folders in GCS: `landing/`, `raw/`, `processed/`, and `archive/`.
+[2026-07-16 09:12:03] ops_priya: +1, that’s what we’ve been aligning to. So for the new bucket you’d have:
+[2026-07-16 09:14:27] sre_neha: Also, for IAM and lifecycle rules we usually scope them by these folder prefixes, so sticking to `landing/`, `raw/`, `processed/`, `archive/` is important. Don’t introduce new top-level folders unless we update the standard.
+[2026-07-16 09:16:02] dev_rahul: Perfect, that’s what I needed. I’ll set up the new GCS bucket with exactly those four folders and wire the pipeline paths accordingly.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone else seeing taflow jobs slowing down a lot on the GCP project this morning? Same pipeline that used to finish in ~25 mins is now taking ~55.
+[2026-07-15 09:04:03] ops_priya: Checking the GCP console now. Do you have a job ID or timestamp?
+[2026-07-15 09:05:47] dev_rahul: Latest run: job `taf-agg-daily-20260715-0830`. The worker logs show a bunch of long-running transforms, but nothing obviously failing. Just sluggish.
+[2026-07-15 09:08:22] lead_aman: For taflow performance on GCP, we should first confirm autoscaling is actually enabled on that job. If it's stuck on a fixed, small worker pool it'll crawl as data volume grows.
+[2026-07-15 09:10:09] sre_neha: Looking at the job details: autoscaling is turned off, and it's using a small worker type. That's probably the main bottleneck. We should enable autoscaling and bump to a more appropriate worker type for this workload.
+[2026-07-15 09:12:41] data_vishal: +1. Also, the profile shows a couple of transforms taking 70% of the total time. We should optimize those expensive transforms (e.g., reduce unnecessary shuffles, pre-aggregate where possible) so taflow can scale more efficiently.
+[2026-07-15 09:15:06] ops_priya: I’ve updated the job template: autoscaling enabled, min=2, max=20 workers, and switched to a larger worker type. Kicked off a new run with the same input.
+[2026-07-15 09:18:57] dev_rahul: New run is already at 60% complete in ~10 mins, whereas the old config was at ~20% by this time. Looks like autoscaling + better worker type is helping a lot.
+[2026-07-15 09:21:12] lead_aman: Nice. Let’s also create a ticket to refactor those heavy transforms; improving them will give us more predictable taflow performance even as data grows.
+[2026-07-15 09:23:39] sre_neha: Job just finished in 24 mins with the new settings. So confirmed: enable autoscaling, choose appropriate worker types, and optimize the expensive transforms. I’ll document this under taflow performance tuning in the GCP FAQ.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone else seeing taflow pipelines slowing down on the nightly runs? Our main job went from ~25 min to almost 50 min over the last week, no code changes on our side.
+[2026-07-16 09:04:37] data_vishal: Yeah, I noticed the dashboards lagging behind by ~30 mins this morning. Do we know if autoscaling is actually enabled on that taflow job or are we stuck on a fixed worker pool?
+[2026-07-16 09:07:12] sre_neha: Checking the current config now. For the `taf-main-etl` pipeline I see `numWorkers=5` and no autoscaling flags set. So it's basically pinned to 5 workers regardless of load.
+[2026-07-16 09:10:09] lead_aman: That explains part of it. For taflow performance we should be enabling autoscaling so it can add workers under heavy load. Rahul, do you see any particularly expensive transforms in the job graph? Big joins, groupBys, or windowed aggregations?
+[2026-07-16 09:12:45] dev_rahul: The heaviest step is a join + aggregation on the events table, and that’s where the profiler shows most time spent. Right now we're using the default worker type too, nothing tuned. Should we bump to a beefier machine type along with autoscaling?
+[2026-07-16 09:15:58] ops_priya: Yes, per our taflow guidelines we should: 1) enable autoscaling, 2) pick appropriate worker types for that heavy join (more CPU/mem), and 3) optimize the expensive transforms themselves. For (3), can we pre-filter or pre-aggregate the events before the big join so we're not shuffling as much data?
+[2026-07-16 09:19:41] data_vishal: I can refactor that transform to aggregate by user/day before the join, instead of joining raw events. That should cut the shuffle size. For the infra piece, I’ll update the job to use autoscaling and switch to the high-CPU worker type we standardize on for taflow.
+[2026-07-16 09:22:03] sre_neha: On it. I’ll update the deployment config: enable autoscaling with reasonable min/max workers and change the worker type on the next scheduled run. I’ll also add a quick note in the runbook that taflow performance tuning = autoscaling + right worker types + optimizing expensive transforms.
+[2026-07-16 09:26:27] dev_rahul: I pushed the transform change to pre-aggregate. Tonight’s run will have autoscaling + new workers + optimized step. I’ll compare runtime vs yesterday and share numbers.
+[2026-07-16 09:33:18] dev_rahul: Update from this morning’s run: pipeline completed in 24 mins, back to normal. Autoscaling ramped from 5 to 14 workers during the heavy join, and overall CPU was much healthier. Looks like enabling autoscaling, choosing better worker types, and optimizing that expensive transform did the trick.
+
+[2026-07-15 09:01:12] dev_rahul: Anyone know why this BigQuery dashboard query suddenly got way slower? Same filters, but latency jumped from ~3s to ~45s since yesterday.
+[2026-07-15 09:03:18] data_vishal: Do you have the query handy + execution details? Wondering if it's doing a full table scan or something changed with partitions/clustering.
+[2026-07-15 09:05:02] dev_rahul: Yeah, core part is:
+[2026-07-15 09:07:47] sre_neha: Is `event_date` actually the partitioning column on that table? If not, that WHERE is probably forcing a full table scan. Also, SELECT * on a big table will be expensive.
+[2026-07-15 09:09:55] data_vishal: Just checked the schema in the console: looks like there's no partitioning configured at all on `proj.analytics.events`, and no clustering either. So for that date filter it's scanning the entire table every time.
+[2026-07-15 09:12:11] ops_priya: That lines up with what I'm seeing in the job stats: "bytes processed: 1.2 TB" for that query, so definitely a full table scan. Also SELECT * is pulling all columns; a bunch of them are wide JSON blobs.
+[2026-07-15 09:14:38] lead_aman: So root causes here are: missing partitions, no clustering, and using SELECT * which together force full table scans. Rahul, can you try limiting columns + confirm?
+[2026-07-15 09:16:22] dev_rahul: Changed it to:
+[2026-07-15 09:18:47] data_vishal: That confirms it. Long-term fix: add partitioning on `event_date` and cluster on something like (`country`, `event_name`). That'll avoid full table scans for these filters and reduce the impact of not using SELECT *.
+[2026-07-15 09:21:03] lead_aman: Cool, let's track a ticket to backfill a partitioned+clustered replacement table and migrate the dashboard. For now, using explicit columns instead of SELECT * is the recommended workaround.
+[2026-07-15 09:22:41] dev_rahul: Got it, updated the dashboard queries to avoid SELECT * and opened a ticket for adding partitions + clustering. Performance is acceptable again for now.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know why our GCP BigQuery dashboard query suddenly got 4x slower since yesterday? Same filters, same time range, but latency went from ~5s to ~20s.
+[2026-07-16 09:04:37] data_vishal: Checking the query now. Did someone change the SQL or underlying table? Things that usually bite us are missing partitions, missing clustering, or it silently falling back to full table scans.
+[2026-07-16 09:07:55] dev_rahul: Here’s the current query:
+[2026-07-16 09:10:42] data_vishal: Yeah, that `SELECT *` plus the base table is a red flag. If `event_date` isn’t used as a partition filter on a partitioned table, BigQuery will do a full table scan. Also, without clustering on `user_country`, the filter won’t prune much.
+[2026-07-16 09:13:21] sre_neha: I pulled the job stats for the last run. It scanned ~1.2 TB vs ~150 GB previously. That’s consistent with losing partition pruning and/or clustering benefits. Possible reasons line up: missing partitions, missing clustering, full table scans, and that `SELECT *`.
+[2026-07-16 09:15:48] lead_aman: So root cause is query regression, not infra. Can we patch it to: use the partitioned table, drop `SELECT *`, and rely on clustering?
+[2026-07-16 09:18:03] data_vishal: Yup, try this:
+[2026-07-16 09:21:27] dev_rahul: Ran that version: latency back down to ~4.8s, bytes processed ~160 GB. That fixes it. I’ll lock the Looker explore to the partitioned table and remove `SELECT *` from the template so this doesn’t regress again.
+[2026-07-16 09:23:10] lead_aman: Nice. Documenting: slowdown was due to full table scans triggered by `SELECT *` on a non-partitioned path and not leveraging clustering. Marking this as resolved.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone seen `tabricks OutOfMemoryError` on GCP recently? Our batch job is dying halfway through a big join and the driver log just ends with OOM.
+[2026-07-15 09:05:09] lead_aman: Yeah, that’s a classic memory pressure issue on the cluster. First thing: can we bump the cluster memory for that workload? Right now what machine type / worker count are you on?
+[2026-07-15 09:07:44] dev_rahul: We’re on a pretty small setup, 2 workers with modest RAM. I can try increasing, but I’m worried we’re just masking a bad pattern. We do a lot of caching before the main join.
+[2026-07-15 09:10:12] data_vishal: If you’re caching aggressively, that’s likely a big part of it. See if you can reduce cache usage to just the truly reused DataFrames. Also, after you’re done with intermediate results, call `unpersist()` so they’re evicted from memory.
+[2026-07-15 09:12:58] sre_neha: +1. From the infra side, I can increase cluster memory for this job run, but we should also optimize the query. Can you paste the join pattern? Are you doing multiple large shuffles?
+[2026-07-15 09:15:47] dev_rahul: The main part is a wide join of two big tables, then we cache the result and do a couple more joins. We never unpersist anything, so memory probably just keeps growing.
+[2026-07-15 09:18:21] lead_aman: That’ll do it. Plan: (1) scale up cluster memory for this pipeline, (2) only cache the big join result if it’s reused, and (3) explicitly `unpersist()` any intermediate DataFrames right after their last use. Also, try to simplify/optimize the joins so you’re not doing unnecessary ones.
+[2026-07-15 09:21:03] ops_priya: I’ve updated the job’s template to use a higher-memory cluster for tonight’s run. Once you push the code changes (reduced caching + `unpersist()` + cleaned-up joins), we can monitor if the OOM disappears.
+[2026-07-15 09:23:36] dev_rahul: Changes pushed: trimmed caches to 2 key DataFrames, added `dfX.unpersist()` after use, and merged two joins into one. Let’s see how it behaves.
+[2026-07-15 09:27:08] sre_neha: Job just completed successfully on the bigger-memory cluster, no `tabricks OutOfMemoryError` this time. Memory graphs look much smoother after the unpersists and join optimization.
+[2026-07-15 09:29:42] dev_rahul: Nice, thanks all. I’ll document: for `tabricks OutOfMemoryError` we should increase cluster memory, cut down cache usage, call `unpersist()`, and tidy up the joins.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone seen a `tabricks OutOfMemoryError` on our GCP jobs? The nightly join pipeline has started dying with OOM on the largest stage after we added a couple more datasets.
+[2026-07-16 09:04:09] lead_aman: Yeah, that’s a classic memory pressure issue. For this one we basically have four levers: bump the cluster memory, trim cache usage, explicitly call `unpersist()`, and tighten up the joins. What’s the current cluster size?
+[2026-07-16 09:06:32] dev_rahul: We’re on the default small cluster, 2 workers, not much RAM. Also I’m caching 3 intermediate DataFrames and never unpersisting them, so that might be hurting us.
+[2026-07-16 09:08:47] sre_neha: First step: increase cluster memory for that job. Either move to a bigger machine type or add workers so the executor memory pool is larger. That alone usually stops the `OutOfMemoryError` in our tabricks jobs.
+[2026-07-16 09:11:55] data_vishal: And yeah, caching 3 big frames without cleanup will blow things up. After you’re done with an intermediate DF, call `df.unpersist()` so it frees memory. Also drop any caches that aren’t reused enough to justify staying in RAM.
+[2026-07-16 09:14:10] ops_priya: On the join side, can you reduce the size? E.g., prune columns before the join, filter earlier, and avoid unnecessary wide joins. That optimization plus more memory + less caching is the recommended combo for tabricks OOM.
+[2026-07-16 09:17:22] dev_rahul: Got it. I’ll: 1) bump the cluster to a higher-memory config, 2) only cache the two DFs we reuse, 3) add `unpersist()` right after their last use, and 4) push filters/column pruning before the big join.
+[2026-07-16 09:20:01] lead_aman: Perfect, that’s exactly what we advise for “tabricks OutOfMemoryError”: increase cluster memory, reduce cache footprint, use `unpersist()`, and optimize the joins. Ping back once the rerun finishes.
+[2026-07-16 09:24:33] dev_rahul: Rerun completed on the larger cluster with those changes—no more OOM, and the job actually finished ~20% faster. We’re good now.
+
+[2026-07-15 09:01:12] dev_rahul: Quick GCP question: how are we supposed to handle credentials for our apps? I saw something about topic 13 in the internal FAQ but it's super terse.
+[2026-07-15 09:03:45] lead_aman: Yeah, the guidance there is: use IAM roles, Secret Manager, and Service Accounts. Absolutely no hardcoded creds in code or config.
+[2026-07-15 09:05:02] dev_rahul: Got it. For a Cloud Run service calling a GCS bucket, does that mean I just rely on the default service account + IAM role, and not store any keys anywhere?
+[2026-07-15 09:07:10] sre_neha: Exactly. Bind the right IAM role (e.g. storage reader/writer) to the Cloud Run service account. The app uses ADC, no JSON key file needed, nothing checked into the repo.
+[2026-07-15 09:09:21] ops_priya: And if you need app-level secrets (DB passwords, API tokens, etc.), put them in Secret Manager and access them via the service account. Still no hardcoded values, even in env vars committed to source.
+[2026-07-15 09:11:03] dev_rahul: Makes sense. I currently have a local `.env` with a DB password that I was about to push to Secret Manager. That’s fine, right, as long as it never goes into git?
+[2026-07-15 09:13:25] lead_aman: Yep, local `.env` for dev is fine, just gitignore it. For non-local: Secret Manager + IAM + service accounts. That’s the pattern from FAQ 13: IAM roles to control access, Secret Manager for sensitive values, service accounts for identity. No credentials hardcoded in code.
+[2026-07-15 09:15:02] dev_rahul: Perfect, I’ll refactor the app to use Secret Manager and remove the inline creds. Thanks all.
+
+[2026-07-16 09:02:11] dev_rahul: Quick GCP question: for a small internal tool I'm building, is it okay if I just drop the DB username/password into an env var on the Cloud Run service, or is there a better "blessed" way we expect folks to handle app creds?
+[2026-07-16 09:04:03] lead_aman: Please don't bake creds directly into env vars or code. For GCP apps we standardize on IAM roles + Service Accounts + Secret Manager. No hardcoded credentials anywhere.
+[2026-07-16 09:05:27] ops_priya: To add to that: create a dedicated service account for the Cloud Run service, grant it only the IAM role it needs (e.g. Cloud SQL Client), and if you still need static secrets (API keys, passwords), store them in Secret Manager and have the service account read them.
+[2026-07-16 09:07:10] data_vishal: Yeah, we had an incident review last quarter where someone committed a connection string into the repo. Policy coming out of that was: use Secret Manager for anything credential-like, and rely on service account IAM wherever possible instead of long-lived keys.
+[2026-07-16 09:09:22] sre_neha: Also, avoid generating service account keys unless absolutely unavoidable. Let the runtime (Cloud Run, GKE, etc.) use the attached service account identity. That way IAM handles auth and you don't manage key files.
+[2026-07-16 09:11:05] dev_rahul: Got it. So pattern is:
+[2026-07-16 09:12:47] lead_aman: Exactly. "Use IAM roles, Secret Manager, and Service Accounts. Never hardcode credentials." That's the line we stick to for all GCP apps.
+[2026-07-16 09:14:30] dev_rahul: Perfect, I'll refactor the prototype to use Secret Manager + a proper service account before we move it out of my sandbox. Thanks all!
+
+[2026-07-15 09:01:12] dev_rahul: Anyone have a sec? My Spark job on Dataproc is taking ~40 mins instead of the usual 10 after I added a couple of joins. Not sure where I messed up on the performance side.
+[2026-07-15 09:03:07] lead_aman: What changed in the pipeline exactly? More joins, different filters, or did you add any collect() calls for debugging?
+[2026-07-15 09:05:10] dev_rahul: I added a join to a small lookup table (~5k rows) and another filter. Also sprinkled a couple of `df.show(50)` and one `df.collect()` to inspect the results before writing to GCS.
+[2026-07-15 09:07:22] sre_neha: That `collect()` is a red flag. On large DataFrames it’ll pull everything to the driver and kill performance. Can you confirm where in the code it is and roughly how big that DF is?
+[2026-07-15 09:09:45] dev_rahul: Yeah, it's right after a big aggregation:
+[2026-07-15 09:11:30] data_vishal: Yeah, remove that `collect()` entirely. If you need to inspect, use `aggDf.limit(100).show()` instead. Also, for that 5k-row lookup table, you should use a broadcast join so Spark doesn’t do a big shuffle:
+[2026-07-15 09:13:52] lead_aman: +1. Also check if your filters can be pushed down earlier. Apply filters before joins/aggregations so Spark can do partition pruning and reduce shuffle volume. And only cache if you reuse a DataFrame multiple times—don’t cache everything by default.
+[2026-07-15 09:16:08] sre_neha: From the best practices doc: focus on (1) broadcast joins for small tables, (2) reducing shuffle, (3) avoiding collect(), (4) caching only reused DataFrames, and (5) using partition pruning. If your input is partitioned by date, make sure you’re filtering on that partition column upfront.
+[2026-07-15 09:18:41] dev_rahul: Got it. I’ve:
+[2026-07-15 09:22:39] dev_rahul: Rerun finished in 11 mins 🎉 Looks back to normal. I only cached one DF that’s read twice later. Thanks for the pointers, this lines up nicely with the Spark perf best practices list.
+[2026-07-15 09:24:01] lead_aman: Nice. Capture those changes in the job’s README so folks remember: broadcast small lookups, minimize shuffle, no collect() on big DFs, cache only when reused, and rely on partition pruning with early filters.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone around? My Spark job on Dataproc suddenly went from ~8 min to ~35 min after I added one more dimension table join. No errors, just super slow. Trying to figure out what obvious performance best practice I might be missing.
+[2026-07-16 09:05:07] lead_aman: Morning. What changed exactly? New join pattern, more collect()s, caching, anything? Paste the relevant bit of the code?
+[2026-07-16 09:07:54] dev_rahul: This is the core part now:
+[2026-07-16 09:10:32] sre_neha: That smells like a shuffle-heavy sort-merge join. For a 50k dim, can you broadcast it instead of doing a regular join? That’s one of our standard Spark perf tips: use broadcast joins when the dimension fits in memory.
+[2026-07-16 09:12:18] data_vishal: +1. Also I see a couple of anti-patterns:
+[2026-07-16 09:15:03] dev_rahul: Got it. I can change the second join to broadcast:
+[2026-07-16 09:18:44] ops_priya: If you only need a subset, can you filter earlier and avoid pulling everything to the driver? Also, try to push your `event_date` filter before the joins so Spark can do partition pruning on the fact table, assuming it’s partitioned by date. That’s another perf best practice we call out.
+[2026-07-16 09:21:09] dev_rahul: Fact is partitioned by `event_date`, yes. I had the filter after the joins 🤦. I’ll rewrite:
+[2026-07-16 09:25:37] sre_neha: Nice. That hits most of the basics: broadcast join for small dim, reduce shuffle, avoid full `collect()`, cache only when reused, and use partition pruning by pushing the date filter down. Let us know the new runtime.
+[2026-07-16 09:29:12] dev_rahul: New run finished in 9m12s 🎉 Shuffle stage dropped from 20+ min to ~2 min. No driver memory warnings now that I’m not doing a full `collect()`. This solves it.
+[2026-07-16 09:31:40] lead_aman: Perfect. Can you add a short note to the team wiki under Spark guidelines summarizing what you changed? Broadcast joins + prune partitions early + no unnecessary cache/collect. That’ll help others avoid the same trap.
+[2026-07-16 09:33:05] dev_rahul: Will do after coffee. Thanks all!
+
+[2026-07-15 09:02:11] dev_rahul: Anyone know what we officially recommend for monitoring our GCP data pipelines? PM is asking if we have a "standard stack" or if it's ad-hoc per team.
+[2026-07-15 09:03:44] lead_aman: For the GCP side, the baseline is Cloud Monitoring + Cloud Logging. That should be the default answer, and it's what we expect every pipeline to hook into.
+[2026-07-15 09:06:02] sre_neha: Yep, and for anything running via Airflow, we also rely on the native Airflow logs. Those are the first place we look for task-level failures and retries.
+[2026-07-15 09:08:27] data_vishal: For the analytics folks, we’ve also got Datadog dashboards wired up for some of the busier data pipelines. That’s more for higher-level SLIs (throughput, failure rate) than per-task debugging.
+[2026-07-15 09:11:10] ops_priya: Don’t forget Prometheus. Some of the services feeding the pipelines expose metrics there, and we have dashboards built on top of those for pipeline health (latency, queue depth, etc.).
+[2026-07-15 09:13:33] dev_rahul: Got it, so the “official” answer is: Cloud Monitoring, Cloud Logging, Airflow logs for orchestration, plus Datadog/Prometheus dashboards where we need richer metrics. I’ll pass that along to the PM and add it to the team wiki.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone have a quick pointer on what we officially recommend for monitoring our GCP data pipelines? PM is asking if we're "standardizing" on a single tool and I don't want to give a wrong answer.
+[2026-07-16 09:03:45] lead_aman: For the GCP data pipelines specifically, we don't mandate a single tool. The verified guidance is basically a toolbox: Cloud Monitoring, Cloud Logging, Airflow logs, Datadog, or Prometheus dashboards.
+[2026-07-16 09:05:02] dev_rahul: Got it. For the answer I'm writing, should I phrase it like "use Cloud Monitoring and Logging" or explicitly list all of those options?
+[2026-07-16 09:07:18] data_vishal: I'd explicitly list them. Something like: "Use Cloud Monitoring, Cloud Logging, Airflow logs, Datadog, or Prometheus dashboards." That matches the source text for Q15 on GCP.
+[2026-07-16 09:09:03] ops_priya: +1, and just to be clear, Airflow logs there means the scheduler/worker logs in our Composer/Airflow setup, not a separate stack. But for the FAQ, you can just say "Airflow logs" as in the source.
+[2026-07-16 09:11:27] sre_neha: Also make sure you don't imply we only support Datadog or only Prometheus. The verified answer is intentionally "or" between them, not "and" or "must use X".
+[2026-07-16 09:13:02] dev_rahul: Perfect, I'll stick exactly to: "Use Cloud Monitoring, Cloud Logging, Airflow logs, Datadog, or Prometheus dashboards." That should keep it aligned with the GCP FAQ.
+[2026-07-16 09:14:25] lead_aman: Yep, that's the correct, verified wording for topic 15. You're good to ship that.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone around for a quick Composer question? One of our DAGs started failing in prod this morning and the UI just shows `failed` on the first task with no obvious clue.
+[2026-07-15 09:04:09] sre_neha: On it. What are you seeing in the task instance logs? Also, is the scheduler looking healthy in the Composer env page?
+[2026-07-15 09:06:32] dev_rahul: Scheduler status in the Composer UI shows green/healthy. In the task logs I see:
+[2026-07-15 09:08:45] lead_aman: That error points to a missing Python package on the workers. Did we add `requests_toolbelt` to the Composer environment’s PyPI deps for prod, or only for dev?
+[2026-07-15 09:10:27] ops_priya: Checking prod Composer config now... under PyPI packages I only see:
+[2026-07-15 09:12:03] data_vishal: That explains the failure. Besides the package, can you confirm the connection config is correct? The first task uses the `http_default` connection, right? Any recent changes there?
+[2026-07-15 09:13:51] dev_rahul: `http_default` looks fine in Airflow connections, same host and extra as dev. Also, the task doesn’t even get to the HTTP call, it crashes immediately on import. Retries are set to 3 but it just fails 3 times with the same `ModuleNotFoundError`.
+[2026-07-15 09:16:02] sre_neha: Cool, so:
+[2026-07-15 09:18:47] ops_priya: Just added `requests_toolbelt==1.0.0` to prod Composer env and triggered an update. It’ll take a few minutes for the workers to pick it up.
+[2026-07-15 09:22:29] data_vishal: Once the update finishes, re-run just the failed task from the Airflow UI. No need to clear the whole DAG.
+[2026-07-15 09:25:41] dev_rahul: Redeploy completed. I cleared the failed task and re-ran it — logs now show:
+
+[2026-07-16 09:02:11] dev_rahul: Anyone around? One of our Composer DAGs (`daily_etl_pipeline`) has been failing since this morning in prod. Airflow UI just shows `task failed` without much context. Not sure where to start digging.
+[2026-07-16 09:04:03] lead_aman: I'm here. First thing: can you confirm if the Composer scheduler is healthy? In the Airflow UI, under "Browse → Jobs" or the environment details, check if the scheduler is up and not in a zombie state.
+[2026-07-16 09:06:45] dev_rahul: Scheduler looks odd. In "Browse → Jobs" I see:
+[2026-07-16 09:09:12] sre_neha: That’s suspicious. Grab the scheduler logs from Composer. In GCP console → Logs Explorer, filter on `resource.type="cloud_composer_environment"` and `log_name` containing `scheduler`. Paste any stack traces you see around the time of the last heartbeat.
+[2026-07-16 09:12:58] dev_rahul: Pulled logs, seeing this repeatedly:
+[2026-07-16 09:15:21] ops_priya: That points to a missing Python package in the Composer environment. Check the `PyPI packages` section of the Composer env in GCP console. Do we have `pandas-gbq` listed there with the right version?
+[2026-07-16 09:18:37] dev_rahul: In the Composer env config I only see:
+[2026-07-16 09:21:09] lead_aman: That would do it. Add `pandas-gbq` in the PyPI packages for that Composer env, save, let it redeploy. While that rolls out, also confirm the BigQuery connection is configured correctly in Airflow (`Conn Id` the DAG uses) so we’re not chasing a second issue.
+[2026-07-16 09:24:55] dev_rahul: Added `pandas-gbq==0.19.2` in Composer, env finished updating. BigQuery connection `gcp_bq_default` looks fine: correct project, key type `Google Cloud`, no recent changes. I retriggered the failed task with 3 retries configured. First attempt just succeeded, DAG run is now `success`.
+[2026-07-16 09:27:03] data_vishal: Nice. So the checklist for future: verify scheduler health, inspect worker logs, ensure required Python packages (like `pandas-gbq`) are installed in Composer, double-check connection config, and rely on task retries once the root cause is fixed.
+[2026-07-16 09:29:18] sre_neha: Cool, let’s add a short runbook entry: “Composer DAG fails → check scheduler, worker logs, missing packages, connections, then use retries.” That should save us some time next outage.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone know why my Cloud Run service can't write to a GCS bucket? The app is getting a 403 when trying to upload objects.
+[2026-07-15 09:04:03] ops_priya: 403 from GCS usually screams IAM. Which service account is Cloud Run using, and what roles does it have?
+[2026-07-15 09:06:12] dev_rahul: Using the default Cloud Run runtime service account. For roles, I only see `Storage Object Viewer` on the project. Error snippet from logs:
+[2026-07-15 09:08:45] lead_aman: Yeah, `Storage Object Viewer` is read-only. To upload you need a role that allows `storage.objects.create`. Check if you can add either `Storage Object Creator` or `Storage Object Admin` to that service account on the bucket or project.
+[2026-07-15 09:10:37] sre_neha: +1. Easiest quick fix:
+[2026-07-15 09:13:02] dev_rahul: Just granted `roles/storage.objectCreator` to the Cloud Run service account at the project level. Retried the upload and it went through, no more 403. Looks like missing IAM was the issue.
+[2026-07-15 09:14:55] data_vishal: Nice. For anything that needs both read and write, `Storage Object Admin` is also an option, but stick to `Object Creator` if you only need uploads.
+[2026-07-15 09:16:21] dev_rahul: Got it. I’ll keep it at `Storage Object Creator` for least privilege. Thanks all, issue resolved.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone know why our GCS upload job from the ETL service started failing this morning? Getting `403 PERMISSION_DENIED` when trying to write objects to the `analytics-raw` bucket.
+[2026-07-16 09:04:27] ops_priya: Checking now. Is it using the `etl-writer-sa@gcp-project.iam.gserviceaccount.com` service account or something else?
+[2026-07-16 09:06:10] dev_rahul: Yeah, that one. Logs show: `Caller does not have storage.objects.create access to the Google Cloud Storage object.` Nothing else useful.
+[2026-07-16 09:08:42] sre_neha: That error usually means missing IAM on the bucket. Can someone run `gcloud storage buckets get-iam-policy gs://analytics-raw` and see what roles `etl-writer-sa` has?
+[2026-07-16 09:11:03] ops_priya: Just checked. The SA only has `roles/storage.objectViewer` on that bucket. No creator/admin roles assigned.
+[2026-07-16 09:13:25] lead_aman: That explains it. For writes we need to grant a role like `Storage Object Creator` or `Storage Object Admin` to that service account on the bucket.
+[2026-07-16 09:15:47] ops_priya: Applying now: `gcloud storage buckets add-iam-policy-binding gs://analytics-raw --member=serviceAccount:etl-writer-sa@gcp-project.iam.gserviceaccount.com --role=roles/storage.objectCreator`
+[2026-07-16 09:18:02] data_vishal: Re-ran the ETL job manually after that change, and uploads are succeeding. No more 403s in the logs.
+[2026-07-16 09:19:55] lead_aman: Nice. Let's document that the service account needs one of those storage object write roles, and maybe add a Terraform check so it doesn’t regress.
+[2026-07-16 09:21:30] dev_rahul: Sounds good, I’ll update the runbook with the required IAM: at least `Storage Object Creator` for write-only, or `Storage Object Admin` if we ever need full object management.
+
+[2026-07-15 09:01:12] dev_rahul: Morning, quick Spark question: my GCP Dataproc job that does a bunch of DataFrame joins is getting slower as the data grows. Any high-level best practices we should be following for rk DataFrame operations? Wondering if we're doing something obviously wrong.
+[2026-07-15 09:03:47] lead_aman: Hey Rahul, for rk DataFrame ops the main guidelines are: filter as early as you can, select only the columns you actually need, avoid super wide transformations, and only repartition when it’s really necessary.
+[2026-07-15 09:05:02] dev_rahul: Got it. Right now our pipeline loads the full table and only filters right before the final write. Example:
+[2026-07-15 09:07:18] lead_aman: Exactly. Do:
+[2026-07-15 09:09:01] data_vishal: Also check your `select`s. If you’re doing `select("*")` all the way and only trimming at the end, that’s going to hurt. For rk DataFrame performance, selecting just the needed columns early helps a lot, especially before joins and aggregations.
+[2026-07-15 09:11:24] dev_rahul: Yeah, we’re guilty of `select("*")` everywhere. I’ll change it to:
+[2026-07-15 09:13:32] lead_aman: Right. Avoid making the DataFrame extremely wide if you don’t need all those derived columns downstream. Compute only what’s required for the final output or for the next steps. Wide transformations increase memory pressure and shuffle size.
+[2026-07-15 09:15:09] sre_neha: On repartitioning: I saw in your last job run you have `df.repartition(800)` in two different places. For rk DataFrame ops, only repartition when you have a clear reason (e.g., skew fix, target file count). Extra repartitions just add shuffle overhead.
+[2026-07-15 09:17:26] dev_rahul: Makes sense. I’ll keep a single repartition right before the final write and drop the earlier one. So summary: filter early, select only required columns, don’t bloat the DF with unnecessary derived columns, and minimize repartitions. I’ll refactor and rerun the job.
+[2026-07-15 09:20:41] ops_priya: Just checked the latest run after your changes: job duration dropped from ~42 mins to ~24 mins, and shuffle read went down by ~40%. Looks like those rk DataFrame best practices did the trick.
+[2026-07-15 09:22:03] dev_rahul: Awesome, thanks all. I’ll document these points in the job README so we don’t regress later.
+
+[2026-07-16 09:02:11] dev_rahul: Morning, quick Spark question on GCP: my job that does a bunch of joins on a pretty wide DataFrame is super slow after we moved to the new cluster. Any best practices we should be following specifically for DataFrame ops to speed this up?
+[2026-07-16 09:04:03] lead_aman: For general Spark DataFrame performance, we should be sticking to a few basics: filter as early as possible, only select the columns we actually need, avoid making the DataFrame unnecessarily wide, and only repartition when there's a clear need. Do you know where in your pipeline the joins happen relative to filters/selects?
+[2026-07-16 09:06:27] dev_rahul: Right now it's roughly: read -> a couple of withColumns -> join with 3 other tables -> then filter + select at the end. The main DF has ~250 columns by the time we hit the joins.
+[2026-07-16 09:08:10] data_vishal: 250 columns before the joins sounds like trouble. If we follow the guidance, you should push the filter up right after the read, then select only the columns you need for the joins + final output. That’ll shrink the data before the heavy operations.
+[2026-07-16 09:10:42] sre_neha: Also, are you doing any explicit `repartition` or `coalesce` calls? The recommendation is to repartition only when it’s actually needed. Unnecessary repartitions can add a lot of shuffle overhead.
+[2026-07-16 09:12:05] dev_rahul: Yeah, I have a `repartition(400)` right after the first read because I copied it from another job. No strong reason for 400 tbh.
+[2026-07-16 09:14:22] lead_aman: Then I'd definitely clean that up. Per the guidelines:
+[2026-07-16 09:17:09] ops_priya: +1. Blind repartitioning is usually expensive. Start with the default partitioning, then only repartition if you see skew or very large partitions in the Spark UI. That aligns with the “repartition only when necessary” rule we’ve documented.
+[2026-07-16 09:19:41] dev_rahul: Got it. I’ll: remove the `repartition(400)`, push the filter right after the read, and add a `select` before the joins to keep only the join keys + required output columns. Will rerun and share numbers.
+[2026-07-16 09:24:03] dev_rahul: Reran with those changes: runtime dropped from ~38 mins to ~19 mins on the same cluster. Looks like following the “filter early, select needed columns, avoid wide transforms, and repartition only when necessary” rule of thumb did the trick.
+[2026-07-16 09:25:18] lead_aman: Nice improvement. Let’s document that pattern in the job’s README so others don’t repeat the wide-DF + unnecessary repartition issue.
+
+[2026-07-15 09:02:11] dev_rahul: Quick BigQuery question: what's our recommended way to handle schema changes on a prod table that's feeding multiple dashboards? Got a request to add a couple of fields and I'm worried about breaking stuff.
+[2026-07-15 09:04:37] lead_aman: For prod BQ tables we generally follow schema evolution, not destructive changes. What kind of change is it—add columns, change type, or drop/rename?
+[2026-07-15 09:06:10] dev_rahul: Mostly adding 2 nullable columns, but PM also asked if we can "clean up" some old fields we don't use. This table is written by a Dataflow job and consumed by Looker + a few ad-hoc queries.
+[2026-07-15 09:08:22] data_vishal: Adding nullable columns is fine with schema evolution, BigQuery handles that well. The risky part is removing/renaming existing fields—those can break queries and downstream tools.
+[2026-07-15 09:10:03] sre_neha: +1. Also, make sure we validate incoming data against the updated schema in the pipeline before it lands in the prod table. Last time we skipped validation, malformed records started failing inserts silently in one region.
+[2026-07-15 09:12:45] data_vishal: Our pattern is: 1) define a new versioned schema for the pipeline (e.g. v3) in the repo, 2) update the Dataflow job to use it and validate payloads, 3) roll out to a staging table first, 4) then apply the same schema evolution (add columns) to the prod table. We never just "edit" prod without a versioned schema.
+[2026-07-15 09:15:01] lead_aman: And for the "cleanup": mark old fields as deprecated in the schema definition and dashboards, but don't drop them from the BigQuery table in prod yet. We keep versioned schemas so consumers can migrate at their own pace before we consider a later breaking change.
+[2026-07-15 09:17:29] ops_priya: From an ops side, please also add a simple validation step in the pipeline (even a schema check + basic type checks) and maybe a metric for rejected rows, so we know if the new fields are causing issues.
+[2026-07-15 09:19:10] dev_rahul: Got it. So: use schema evolution to add the new nullable fields, wire them into a new versioned schema for the Dataflow job, validate incoming data against that, and avoid dropping existing columns for now. I’ll follow the versioned schema flow and stage it first.
+[2026-07-15 09:21:02] lead_aman: Exactly. Best practice is: schema evolution where it’s safe, validate incoming data before it hits BigQuery, and keep versioned schemas for all prod pipelines so changes are traceable and reversible.
+
+[2026-07-16 09:02:11] dev_rahul: Quick question on BigQuery pipelines: what's our recommended way to handle schema changes on a production table? We have a new field coming in from the events stream and I'm not sure if we should recreate the table or just ALTER it.
+[2026-07-16 09:04:03] lead_aman: For prod, we should be following schema evolution, not table recreation. As long as it's additive (new nullable columns), we can evolve the schema safely rather than doing destructive changes.
+[2026-07-16 09:06:27] data_vishal: +1. Also, before we let the new field hit the main table, we should validate the incoming data structure. Are we checking that the new field is present/typed correctly in the ingestion step?
+[2026-07-16 09:08:10] dev_rahul: Right now, no explicit validation. The Dataflow job just maps whatever comes in and writes to the same BigQuery table. Was thinking of just adding the field to the schema and letting it flow.
+[2026-07-16 09:10:42] sre_neha: We should tighten that. Best practice we’ve been pushing is: 1) evolve the schema (e.g., add new columns) in a controlled way, 2) validate the payloads before they hit the prod table, and 3) keep versioned schemas for the pipeline so we know exactly which job version wrote which shape.
+[2026-07-16 09:12:55] ops_priya: On the versioned schemas point: for this change, can you bump the pipeline config to something like `events_v3` and store the updated BigQuery schema JSON alongside it? That way we know v2 vs v3, and rollbacks are easier if the new field causes issues.
+[2026-07-16 09:15:33] data_vishal: Yep. So concrete steps: 1) define updated schema JSON (with new nullable field) and check it into the repo as a new version, 2) add validation in the ingestion step for that field (type, allowed values), 3) run `ALTER TABLE ... ADD COLUMN` in BigQuery, 4) deploy the pipeline pointing to the new schema version.
+[2026-07-16 09:18:01] lead_aman: That aligns with our BigQuery best practice: use schema evolution where it’s safe, validate incoming data, and maintain versioned schemas for all prod pipelines. No table recreation needed here as long as it’s additive.
+[2026-07-16 09:19:47] dev_rahul: Got it. I’ll add validation, create a v3 schema file, run the ALTER to add the nullable field, and deploy the pipeline with the new schema version. Thanks all, that answers it.
+
+[2026-07-15 09:02:11] dev_rahul: Anyone got a sec? Our nightly GCP data pipeline dropped a batch again and I’m getting pressure to "make it more reliable", but the feedback is super vague. What concrete things should we be putting in place to improve reliability of these pipelines?
+[2026-07-15 09:04:03] lead_aman: Yeah, "be more reliable" is always vague 🙂. Think in terms of: retries, idempotency, monitoring/alerting, checkpointing, and logging. We should cover all of those for the pipeline.
+[2026-07-15 09:06:12] dev_rahul: Got it. On retries: right now our Dataflow job just fails on transient BigQuery write errors. Are we saying we should configure automatic retries on those steps instead of hard failing?
+[2026-07-15 09:08:27] sre_neha: Exactly. Add retries with backoff on the external calls (BigQuery, Pub/Sub, any APIs). But pair that with idempotent processing so a retried write or reprocessed message doesn’t create duplicates.
+[2026-07-15 09:11:09] data_vishal: For idempotency, we can key off the source event ID we already have. Store that as a dedupe key in the target table so if the same event is processed twice (due to retry), the write is effectively a no-op.
+[2026-07-15 09:13:22] ops_priya: Don’t forget monitoring + alerting. Right now we only see failures in logs after the fact. We should add metrics on pipeline success/failure, lag, and throughput, then set alerts when failure rates spike or the job stops progressing.
+[2026-07-15 09:15:48] lead_aman: And add checkpointing so we can resume from a known good point instead of replaying everything. For streaming, that’s typically offsets / watermarks; for batch, it can be per-partition or per-file markers.
+[2026-07-15 09:18:05] sre_neha: Plus comprehensive logging: log each stage transitions, external calls, checkpoint creation, and retry attempts with reasons. That’s how we’ll actually debug the next incident instead of guessing.
+[2026-07-15 09:20:37] dev_rahul: So to summarize for this pipeline: implement retries with backoff, make the transforms idempotent using event IDs, add monitoring + alerts on failures/lag, introduce checkpointing for resume, and beef up stage-by-stage logging. That should tick the "reliability" box?
+[2026-07-15 09:22:41] lead_aman: Yep, that’s the checklist. If we implement those five—retries, idempotent processing, monitoring/alerting, checkpointing, and detailed logging—we’ll have a much more reliable pipeline and clearer story for stakeholders.
+
+[2026-07-16 09:02:11] dev_rahul: Anyone has a good checklist for improving reliability of our GCP dataflow pipelines? Yesterday’s nightly job silently dropped a batch and we only caught it from a downstream anomaly alert.
+[2026-07-16 09:04:37] lead_aman: For reliability, we should be systematic: retries, idempotent processing, monitoring + alerting, checkpointing, and solid logging. Which of these do we already have in place on that nightly job?
+[2026-07-16 09:06:12] dev_rahul: Retries are on (Dataflow default), but idempotency is weak (we just upsert on a composite key). Monitoring is mostly just Dataflow job health, and logging is sparse—no per-batch markers or failure context. No explicit checkpointing beyond what Dataflow does.
+[2026-07-16 09:08:55] sre_neha: We should tighten all five. For retries, make sure the external sinks (BQ / PubSub / GCS) can handle repeated writes safely → that’s where idempotent processing matters. Also, set up alerts on both pipeline errors *and* missing expected outputs.
+[2026-07-16 09:11:29] data_vishal: +1. For idempotency, we can add a deterministic batch_id (e.g. event_date + source_offset) and ensure every transform that writes out is idempotent on that key. That way retries won’t create dupes when we crank up retry counts.
+[2026-07-16 09:13:42] ops_priya: For monitoring/alerting, I can wire up checks that validate: “Did we get N rows for date D?” and page if it’s below a threshold. Also, we should alert on pipeline error rates, not just when the job fully fails.
+[2026-07-16 09:16:10] dev_rahul: Makes sense. What about checkpointing—do we need anything beyond what Dataflow gives us?
+[2026-07-16 09:18:44] lead_aman: We should treat checkpointing explicitly: rely on Dataflow’s built-in checkpoints, but also add logical checkpoints in the pipeline (e.g., write intermediate outputs with clear markers) so we can resume from a known-good stage if something corrupts downstream.
+[2026-07-16 09:21:03] sre_neha: And logging: let’s log at each stage with batch_id, record counts, and any retry attempts. On failures, log the error plus the affected batch_id so we can replay that slice safely since we’ve made the processing idempotent.
+[2026-07-16 09:23:36] dev_rahul: Got it. I’ll: (1) introduce batch_id + idempotent writes, (2) beef up logging around stage boundaries, (3) add logical checkpoints via intermediate outputs, and (4) work with Priya on monitoring/alerts. That should cover retries, idempotency, monitoring/alerting, checkpointing, and logging.
+[2026-07-16 09:25:58] lead_aman: Perfect. Once that’s in, yesterday’s kind of silent drop should either auto-recover via retries or be clearly surfaced via alerts + logs.

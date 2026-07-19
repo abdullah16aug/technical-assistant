@@ -23,7 +23,7 @@ llm = ChatBedrock(
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
 # --- Memory ---
@@ -52,30 +52,30 @@ def ingest_faqs(file_path: str):
     chunks = text_splitter.create_documents([text], metadatas=[{"source_type": "faq", "file": file_path}])
     vectorstore.add_documents(chunks)
     return f"Successfully ingested {len(chunks)} FAQ chunks."
-
 def ingest_chats(file_path: str):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File {file_path} not found.")
     with open(file_path, "r") as f:
         full_chat_text = f.read()
     
+    # 📝 We updated the prompt to explicitly ask for the solver's name
     chat_prompt = f"""Extract all technical questions and their verified solutions from this chat log.
-    Ignore casual talk.
+    Ignore casual talk. Identify the name of the person who provided the solution and the timestamp when the solution was given.
     
     Chat Log:
     {full_chat_text}
     
     Format:
     Question: [Summary]
-    Verified Answer: [Summary]"""
-    
+    Verified Answer: [Summary]
+    Resolved By: [Name of the person]
+    Date Resolved: [Timestamp of the solution]"""
     response = llm.invoke(chat_prompt)
     extracted_content = response.content.strip()
     
     chat_doc = Document(page_content=extracted_content, metadata={"source_type": "chat_history", "file": file_path})
     vectorstore.add_documents([chat_doc])
     
-    # We now return a dictionary containing both the status message and the LLM output
     return {
         "message": "Successfully curated and ingested chat history.",
         "extracted_data": extracted_content
