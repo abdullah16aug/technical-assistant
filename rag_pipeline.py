@@ -53,15 +53,19 @@ def route_query(state: GraphState) -> GraphState:
     """Uses the LLM to classify the user's question as greeting or technical."""
     question = state["question"]
 
+    messages = state.get("messages", [])[-20:]
     classification_prompt = f"""Classify the following user message into exactly one category.
 
 Categories:
-- "greeting": casual talk, hello, hi, how are you, thanks, bye, etc.
+- "greeting": casual talk, hello, hi, how are you, thanks, bye, personal introductions (like "I am...", "my name is..."), or any non-technical conversation.
 - "technical": any question about engineering, infrastructure, systems, debugging, documentation, or technical knowledge.
+
+If unsure, classify as "greeting".
 
 User Message: {question}
 
 Respond with ONLY one word: greeting or technical"""
+
 
     response = llm.invoke(classification_prompt)
     query_type = response.content.strip().lower()
@@ -82,6 +86,9 @@ def handle_greeting(state: GraphState) -> GraphState:
 The user sent a casual message. Respond warmly and briefly. 
 Let them know you're here to help with technical questions.
 
+IMPORTANT: If conversation history shows conflicting user information (like different names),
+always trust the MOST RECENT message.
+
 User Message: {question}
 Response:"""
 
@@ -101,7 +108,8 @@ Response:"""
 def rewrite_query(state: GraphState) -> GraphState:
     """Contextualizes the question using conversation history from MemorySaver."""
     question = state["question"]
-    messages = state.get("messages", [])
+    # Use last 20 messages (10 conversation turns):
+    messages = state.get("messages", [])[-20:]
 
     if not messages:
         return {"standalone_query": question}
@@ -145,6 +153,9 @@ def generate_answer(state: GraphState) -> GraphState:
     final_prompt = f"""You are a helpful engineering assistant. 
     Use the retrieved technical context and the conversation history to answer the user's question.
     If you don't know the answer based on the context, say so.
+    
+    IMPORTANT: If the user has provided conflicting information (like different names), 
+    always trust the MOST RECENT message. Treat newer messages as corrections to older ones.
     
     Conversation History:
     {history_text}
