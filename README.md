@@ -1,448 +1,273 @@
-# 🤖 TeamAssistant — Agentic RAG Bot
+# 🤖 TeamAssistant — Production Agentic RAG & Knowledge Platform
 
-An **Agentic RAG (Retrieval-Augmented Generation)** knowledge assistant for engineering teams, acting as the backend for the **TeamAssistant** product. It answers technical questions by retrieving context from internal documentation, FAQs, and Microsoft Teams chat logs — and falls back to live web search when the internal knowledge base doesn't have the answer. Built with **LangGraph**, **FastAPI**, **Streamlit**, **ChromaDB**, and **Amazon Bedrock**.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
+[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-green.svg)](https://fastapi.tiangolo.com/)
+[![Streamlit](https://img.shields.io/badge/Frontend-Streamlit-red.svg)](https://streamlit.io/)
+[![AWS Bedrock](https://img.shields.io/badge/LLM-AWS%20Bedrock-yellow.svg)](https://aws.amazon.com/bedrock/)
+[![ChromaDB](https://img.shields.io/badge/VectorDB-ChromaDB-purple.svg)](https://www.trychroma.com/)
+
+**TeamAssistant** is an enterprise-ready, stateful **Agentic Retrieval-Augmented Generation (RAG)** platform engineered to assist technical teams with product documentation, FAQs, and incident resolution. Built on a modular **LangGraph** state graph, it combines dynamic intent classification, multi-turn dialogue planning, semantic vector search, corrective document grading (Self-RAG / Corrective RAG), live web search fallbacks, and real-time two-phase SSE token streaming.
 
 ---
 
-## 🧠 What We Built — The Full Picture
+## 📌 Table of Contents
+- [Problem Statement & Solution](#-problem-statement--solution)
+- [Key Features](#-key-features)
+- [System Architecture](#-system-architecture)
+- [LangGraph State Machine Workflow](#-langgraph-state-machine-workflow)
+- [Project Directory Structure](#-project-directory-structure)
+- [Tech Stack & Justification](#-tech-stack--justification)
+- [End-to-End Execution Flow](#-end-to-end-execution-flow)
+- [Knowledge Ingestion Engine](#-knowledge-ingestion-engine)
+- [API Reference](#-api-reference)
+- [Getting Started](#-getting-started)
+- [Future Engineering Roadmap](#-future-engineering-roadmap)
 
-This is not a simple Q&A bot. It is a **multi-node agentic system** where every query passes through a decision-making graph before an answer is produced. Each node in the graph has a specific role:
+---
+
+## 💡 Problem Statement & Solution
+
+### The Challenge
+Standard RAG pipelines (Naive RAG) suffer from critical production limitations:
+1. **High Latency & Costs:** Every query (even a simple "hello") triggers expensive vector database lookups and full LLM generation loops.
+2. **Hallucinations on Out-of-Domain Queries:** When the vector DB retrieves irrelevant context, LLMs generate plausible but incorrect answers.
+3. **Ambiguous User Queries:** Queries like *"how do I fix the error?"* lack context and cause Naive RAG systems to fetch random irrelevant documents.
+4. **Lack of Conversational Context:** Naive chains lack state management, failing to resolve co-references in multi-turn dialogues (*"How do I configure it?"*).
+
+### The Solution
+**TeamAssistant** addresses these vulnerabilities using an **Agentic RAG State Graph**:
+- **Intent Consolidation & Fast-Pathing:** Single-pass structured output classification (`classify_and_plan`) with regex fast-pathing to eliminate redundant LLM hops.
+- **Ambiguity Guardrails:** Detects vague queries before hitting the vector DB and asks targeted clarifying questions.
+- **Corrective RAG & Web Fallback:** Evaluates document relevance heuristically and via LLM grading (`grade_documents`). Automatically falls back to Tavily live web search if internal knowledge is missing.
+- **Two-Phase SSE Token Streaming:** Streams node execution traces in Phase 1, followed by word-by-word LLM token generation in Phase 2 for a seamless user experience.
+
+---
+
+## ✨ Key Features
+
+- 🧠 **Agentic State Machine:** Multi-step graph powered by LangGraph with `MemorySaver` checkpointer for stateful multi-turn history.
+- ⚡ **Low-Latency Architecture:** Consolidated classification node using Pydantic structured output (`with_structured_output`), reducing Bedrock round-trips by 50%.
+- 🛡️ **Self-Corrective Quality Control:** Automated relevance grading prevents context pollution and hallucinated responses.
+- 🌐 **Graceful External Web Search:** Seamless integration with Tavily AI Search for out-of-domain technical queries.
+- 📥 **Multi-Format Technical Knowledge Ingestion:** Automated chunking and LLM-assisted curation of Markdown docs, FAQs, and raw chat exports.
+- 🚀 **Asynchronous Two-Phase Streaming API:** SSE-powered FastAPI backend delivering real-time execution trace badges + LLM token streaming to Streamlit UI.
+
+---
+
+## 🏗️ System Architecture
 
 ```
-User Question
-      │
-      ▼
-┌─────────────────────┐
-│  classify_and_plan  │  ← LLM classifies intent + checks ambiguity (Structured Output)
-└────────┬────────────┘
-         │
-    ┌────┼──────────────┐
-    ▼    ▼              ▼
-greeting technical    technical
-    │  (vague)       (specific)
-    ▼    │              │
-┌────────┴──┐  ┌────────┴─────┐
-│  handle_  │  │ask_clarific- │  │rewrite_query │  ← Contextualizes with chat history
-│  greeting │  │ation         │  └──────┬───────┘
-└────┬──────┘  └──────┬───────┘         ▼
-     │         │          ┌──────────────────┐
-     │         │          │retrieve_documents │  ← ChromaDB vector similarity search
-     │         │          └──────┬───────────┘
-     │         │                 ▼
-     │         │          ┌──────────────┐
-     │         │          │grade_documents│  ← Are docs relevant? (LLM grader)
-     │         │          └──────┬───────┘
-     │         │            ┌────┴──────┐
-     │         │            ▼            ▼
-     │         │        relevant      not relevant
-     │         │            │            │
-     │         │            ▼            ▼
-     │         │    ┌───────────────┐  ┌──────────┐
-     │         │    │generate_answer│  │web_search│  ← Tavily live web search
-     │         │    └───────┬───────┘  └────┬─────┘
-     ▼         ▼            ▼               ▼
-    END       END          END             END
+                               ┌──────────────────────────┐
+                               │   Streamlit Frontend     │
+                               │   (Chat UI & Streaming)  │
+                               └────────────┬─────────────┘
+                                            │ HTTP POST /chat/stream (SSE)
+                                            ▼
+                               ┌──────────────────────────┐
+                               │   FastAPI Backend API    │
+                               │  (Async SSE Controller)  │
+                               └────────────┬─────────────┘
+                                            │
+                                            ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 LangGraph StateGraph                                   │
+│                                                                                        │
+│     ┌─────────────────────┐                                                            │
+│     │  classify_and_plan  │ ──► [Greeting] ──► handle_greeting ──► END                │
+│     └──────────┬──────────┘                                                            │
+│                │                                                                       │
+│                ├──────────────► [Vague Query] ──► ask_clarification ──► END            │
+│                │                                                                       │
+│                ▼ [Specific Technical Query]                                            │
+│     ┌─────────────────────┐                                                            │
+│     │    rewrite_query    │ (Contextualizes multi-turn standalone terms)               │
+│     └──────────┬──────────┘                                                            │
+│                ▼                                                                       │
+│     ┌─────────────────────┐      ┌──────────────────────────┐                          │
+│     │ retrieve_documents  │ ───► │ ChromaDB Vector Storage  │                          │
+│     └──────────┬──────────┘      └──────────────────────────┘                          │
+│                ▼                                                                       │
+│     ┌─────────────────────┐                                                            │
+│     │   grade_documents   │                                                            │
+│     └──────────┬──────────┘                                                            │
+│                │                                                                       │
+│                ├──────────────► [Relevant: YES] ──► generate_answer (KB Context)       │
+│                │                                          │                            │
+│                ▼ [Relevant: NO / Empty Context]           ▼                            │
+│     ┌─────────────────────┐                           ┌──────┐                         │
+│     │     web_search      │ ────────────────────────► │ END  │                         │
+│     │   (Tavily Fallback) │                           └──────┘                         │
+│     └─────────────────────┘                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🔩 Detailed Breakdown of Every Component
+## 🔄 LangGraph State Machine Workflow
 
-### 1. LangGraph — The Brain / Orchestrator
-
-**What it is:** LangGraph is a library built on top of LangChain for building stateful, multi-step workflows using a graph of nodes and edges.
-
-**Why we use it instead of a simple chain:**
-- A plain LangChain chain runs steps in a fixed order: retrieve → generate. No decisions, no branching.
-- LangGraph lets us build **conditional routing**: if the question is a greeting, skip the vector DB entirely; if docs aren't relevant, search the web instead.
-- It manages **state** (`GraphState`) across all nodes, so every node can read what any previous node wrote.
-
-**How it works in our system:**
-- We define a `GraphState` TypedDict with fields like `question`, `answer`, `docs_relevant`, `messages`, etc.
-- Each **node** is a Python function that reads from state and returns a partial update.
-- **Conditional edges** are functions that return the name of the next node to run.
-- `MemorySaver` checkpointer persists conversation history across turns per `thread_id` (session).
-
-**Alternatives:**
-- **LangChain LCEL (plain chains):** Simpler but no branching or decision-making.
-- **CrewAI:** Better for multi-agent teams, overkill for a single-agent RAG system.
-- **AutoGen:** Microsoft's framework, heavy setup for this use case.
-
----
-
-### 2. `GraphState` — Shared Memory Between Nodes
+The graph operates over a central state schema defined in `rag_pipeline.py`:
 
 ```python
 class GraphState(TypedDict):
     session_id: str
-    question: str               # Raw user input
-    standalone_query: str       # Rewritten query for vector search
-    retrieved_context: str      # Text from matched ChromaDB chunks
-    query_type: str             # "greeting" or "technical"
-    docs_relevant: str          # "yes" or "no" from grader
-    sources: list               # Filenames of matched docs
-    needs_clarification: bool   # Set by planner
-    clarification_question: str # Bot's follow-up question
-    answer: str                 # Final answer sent to user
-    messages: Annotated[list, operator.add]  # Auto-accumulating chat history
+    question: str
+    standalone_query: str
+    retrieved_context: str
+    query_type: str
+    docs_relevant: str
+    sources: list
+    needs_clarification: bool
+    clarification_question: str
+    clarification_rounds: int
+    answer_prompt: str
+    answer: str
+    messages: Annotated[list, operator.add]
 ```
 
-**Why `Annotated[list, operator.add]` for messages?**
-LangGraph merges state updates using reducer functions. Without `operator.add`, each node's return would **replace** the messages list. With it, each turn's messages get **appended** to the existing list automatically — giving us persistent memory across turns.
+### Node Execution Responsibilities
+
+| Node Name | Input State Keys | Output State Updates | Architectural Purpose |
+|---|---|---|---|
+| `classify_and_plan` | `question`, `messages` | `query_type`, `needs_clarification`, `clarification_question` | Single-pass classification & ambiguity detection via Pydantic structured output. |
+| `handle_greeting` | `question`, `messages` | `answer`, `messages` | Generates personalized responses using LLM history or regex fast-path. |
+| `ask_clarification` | `question`, `clarification_question` | `answer`, `clarification_rounds`, `messages` | Prompts user for missing details; bounded by hard cap. |
+| `rewrite_query` | `question`, `messages` | `standalone_query` | Transforms conversational queries into standalone search terms. |
+| `retrieve_documents` | `standalone_query` | `retrieved_context`, `sources` | Performs MMR similarity search against local ChromaDB instance. |
+| `grade_documents` | `question`, `retrieved_context` | `docs_relevant` | Self-RAG relevance check with empty-context fast heuristic. |
+| `generate_answer` | `question`, `retrieved_context`, `messages` | `answer_prompt`, `sources` | Formulates final synthesis prompt for external token streaming. |
+| `web_search` | `question` | `answer`, `messages` | Fallback search engine via Tavily API when KB coverage fails. |
 
 ---
 
-### 3. Node: `classify_and_plan` — Intent & Ambiguity Detector
-
-**What it does:** Uses `llm.with_structured_output(PydanticModel)` to classify the query as `"greeting"` or `"technical"`, and simultaneously decides if the question is specific enough to search or too vague. It returns guaranteed typed output — zero fragile string parsing.
-
-**Why this matters:** 
-- Previously, this took two separate Bedrock round-trips. Now it happens in a single LLM call, saving ~700ms of latency per message.
-- A simple greeting regex intercepts `"hi"` or `"thanks"` before hitting the LLM at all, costing zero compute.
-
-**Example of what it catches:**
-- ❌ `"pipeline is failing"` → vague (which pipeline? Airflow? Spark? Dataflow?)
-- ✅ `"Airflow DAG failing with Cloud SQL connection timeout"` → specific
-
-**What happens after:**
-- `greeting` → `handle_greeting` (casual, warm response, no DB hit)
-- `technical (vague)` → `ask_clarification` (stops graph and asks user)
-- `technical (specific)` → `rewrite_query` (proceeds to RAG)
-
----
-
-### 5. Node: `rewrite_query` — Query Contextualizer
-
-**What it does:** Takes the user's question + conversation history and rewrites it as a **standalone search query** for ChromaDB.
-
-**Why this matters:**
-- Users ask follow-up questions: `"What about the timeout config?"` — this makes no sense without context.
-- The rewriter turns it into: `"Airflow Cloud SQL connection timeout configuration"` — a complete search phrase.
-
-**Safety check:** If the LLM returns a verbose paragraph (it sometimes does), we fall back to the original question (anything >150 chars or multi-line is rejected).
-
----
-
-### 6. ChromaDB — The Vector Database
-
-**What it is:** ChromaDB is a local, embedded vector database that stores text chunks as mathematical vectors (embeddings) and retrieves the most similar chunks given a query.
-
-**Why we use it instead of a traditional database:**
-- Traditional DBs (SQL, MongoDB) match by exact keywords. They can't understand meaning.
-- ChromaDB matches by **semantic similarity** — "connection refused" will match "cannot connect to host" even though no keywords overlap.
-
-**How ingestion works:**
-1. Text is split into 500-character chunks with 50-char overlap (prevents cutting off mid-sentence).
-2. Each chunk is embedded using `all-MiniLM-L6-v2` (a 384-dimension vector).
-3. Chunks + metadata (filename, source type) are stored persistently in `./chroma_db/`.
-
-**How retrieval works:**
-1. The standalone query is embedded into the same vector space.
-2. ChromaDB finds the top-3 most similar chunks (cosine similarity).
-3. Those chunks become the `retrieved_context` passed to the LLM.
-
-**Alternatives:**
-- **Pinecone:** Managed cloud vector DB, needs API key and internet.
-- **Weaviate:** Open-source but heavier to self-host.
-- **pgvector:** PostgreSQL extension for vectors, good if you already use Postgres.
-- **FAISS:** Facebook's library, fast but no metadata filtering or persistence out-of-box.
-
-**Why ChromaDB here:** Zero-config, fully local, no external dependencies, persists to disk automatically.
-
----
-
-### 7. HuggingFace Embeddings — `all-MiniLM-L6-v2`
-
-**What it does:** Converts text into a 384-dimensional vector that captures semantic meaning. "Cloud SQL connection error" and "database connectivity failure" will be close together in this vector space.
-
-**Why this model specifically:**
-- Small (80MB) — loads fast, runs on CPU.
-- High quality for its size — consistently ranked top-5 on MTEB (Massive Text Embedding Benchmark) for retrieval tasks.
-- Free, no API key needed.
-
-**Alternatives:**
-- `text-embedding-3-small` (OpenAI) — better quality, costs money per token.
-- `embed-english-v3.0` (Cohere) — excellent quality, API key required.
-- `bge-large-en-v1.5` — better accuracy, ~4x larger and slower.
-
----
-
-### 8. Node: `grade_documents` — The Relevance Gatekeeper
-
-**What it does:** Uses `llm.with_structured_output(PydanticModel)` to ask: "Are these documents relevant to the question?" Returns a reliable boolean `relevant: True/False`.
-
-**Fast Heuristic:** If the retrieved context is empty or < 50 characters, it skips the LLM grader entirely and immediately routes to web search, saving an LLM call.
-
-**Why this matters (prevents hallucination):**
-- Without a grader, the LLM receives irrelevant chunks and tries to answer anyway — making up plausible-sounding but wrong answers.
-- With the grader, if ChromaDB returns GCP firewall rules for a question about Kubernetes CPU limits, the grader catches the mismatch and routes to web search instead.
-
-**What happens after:**
-- `yes` → `generate_answer` (answer from your knowledge base)
-- `no` → `web_search` (Tavily fallback)
-
----
-
-### 9. Claude Haiku via Amazon Bedrock — The LLM
-
-**What it is:** `anthropic.claude-3-haiku-20240307-v1:0` is Anthropic's smallest, fastest Claude model. It's accessed via AWS Bedrock — Amazon's managed LLM API gateway.
-
-**Why Bedrock specifically:**
-- If your team already uses AWS, IAM handles auth — no separate API keys.
-- Bedrock gives access to multiple model providers (Anthropic, Meta, Mistral, Amazon Nova) through one API.
-- Data stays in your AWS region (no data going to Anthropic's servers directly).
-
-**Why Claude Haiku and not a bigger model:**
-- The pipeline makes 4-5 LLM calls per message (classifier, planner, rewriter, grader, generator). A bigger model would be 5-10x slower and more expensive.
-- Haiku is fast enough for real-time chat and smart enough for classification and grading tasks.
-
-**Alternatives:**
-- `amazon.nova-lite-v1:0` (Amazon Nova Lite) — cheaper, similar speed.
-- `meta.llama3-8b-instruct-v1:0` (Llama 3) — fully open-source weights.
-- `gpt-4o-mini` (OpenAI) — similar capability/price, different API.
-
----
-
-### 10. Node: `web_search` — Tavily Fallback
-
-**What it does:** When the knowledge base has no relevant documents, queries Tavily's search API, gets 3 clean result snippets, and generates an answer with the LLM using those results as context.
-
-**Why Tavily and not Google/Bing:**
-- Tavily is specifically built for LLM agents — it returns clean, pre-parsed text snippets instead of raw HTML.
-- No rate limiting or bot blocking (unlike DuckDuckGo).
-- Results include `title`, `url`, and `content` (already extracted, no parsing needed).
-- Free tier: 1,000 searches/month.
-
-**Why we use the original question for web search (not the rewritten standalone_query):**
-- The standalone query is optimized for internal ChromaDB search — sometimes over-simplified.
-- The original question has natural phrasing that search engines understand better.
-
-**Graceful degradation:**
-- If `TAVILY_API_KEY` is not set → honest message explaining web search is not configured.
-- If quota is exhausted → specific message about rate limiting.
-- If network error → generic error message with fallback guidance.
-
-**Alternatives:**
-- DuckDuckGo (`duckduckgo-search`) — free, no API key, but inconsistent and rate-limited.
-- Google Search API (via SerpAPI) — reliable, costs $50+/month for 5,000 searches.
-- Bing Search API — $7/1000 queries, more reliable than DuckDuckGo.
-
----
-
-### 11. `MemorySaver` — Conversation Memory
-
-**What it does:** LangGraph's built-in in-memory checkpointer. After each graph run, it saves the entire `GraphState` (including the `messages` list) keyed by `thread_id` (your session ID). On the next run, it loads the saved state and merges it with the new initial state.
-
-**Why this gives us persistent memory:**
-- `messages: Annotated[list, operator.add]` + MemorySaver = the bot remembers your name, context, and previous questions within the same browser session.
-- If you say "my name is Rahul" in turn 1, the bot will address you as Rahul in turn 5.
-
-**Limitation:** In-memory only. If the FastAPI server restarts, conversation history is lost. For production, replace with `SqliteSaver` or `PostgresSaver`.
-
----
-
-### 12. FastAPI — The Backend API
-
-**What it does:** Exposes the LangGraph pipeline as HTTP endpoints that the Streamlit frontend calls.
-
-**Endpoints:**
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/chat` | Non-streaming: returns full `{answer, trace}` JSON |
-| `POST` | `/chat/stream` | **Two-phase SSE streaming**: yields trace steps live, then streams tokens |
-| `POST` | `/ingest/documentation` | Ingest a `.md` documentation file |
-| `POST` | `/ingest/faq` | Ingest a `.md` FAQ file |
-| `POST` | `/ingest/chats` | Ingest chat logs (LLM extracts Q&A pairs) |
-
-**Two-Phase Streaming via SSE:**
-- **Phase 1 (Trace):** Graph execution traces (e.g. `retrieve_documents → 3 source(s)`) stream instantly as nodes complete.
-- **Phase 2 (Tokens):** Once `generate_answer` builds the prompt, the FastAPI endpoint calls `llm.stream()` and yields the final response word-by-word back to Streamlit, creating a fast, ChatGPT-like live typing effect.
-
-**Why FastAPI and not Flask:**
-- FastAPI has native `async` support, Pydantic validation, and automatic Swagger docs at `/docs`.
-- `StreamingResponse` makes SSE trivial to implement.
-- ~2-3x faster than Flask for I/O-bound workloads.
-
----
-
-### 13. Streamlit — The Chat Frontend
-
-**What it does:** Renders the chat UI with message history, the live streaming trace panel, and the knowledge base upload form.
-
-**The streaming trace panel:**
-```python
-with st.status("🔍 Analyzing your question...", expanded=True) as status:
-    with requests.post("/chat/stream", stream=True) as response:
-        for line in response.iter_lines():
-            if line.startswith(b"data: "):
-                data = json.loads(line[6:])
-                if data["trace_step"]:
-                    st.write(f"✅ {data['trace_step']}")   # live update!
-                if data["done"]:
-                    bot_answer = data["answer"]
-    status.update(label="✅ Done", state="complete")
-```
-
-Each node's completion event arrives as an SSE line → Streamlit writes it to `st.status()` → user sees the trace building up in real time while waiting.
-
-**Chat history ingestion (LLM extraction):**
-When a `.txt` chat log is uploaded, the LLM doesn't just chunk it — it reads the entire chat, extracts only the **technical Q&A pairs**, and stores that curated content. This means casual greetings, off-topic messages, and repeated content are automatically filtered out.
-
----
-
-## 🗺️ Complete Data Flow
-
-```
-User types: "Our Airflow DAG failed. Cloud SQL connection timeout."
-                │
-                ▼ POST /chat/stream (SSE)
-                │
-         ┌──────────────────────────────────────────────────────┐
-         │                  LangGraph Graph                      │
-         │                                                       │
-         │  classify_and_plan ────────────────────► "technical", "specific"
-         │       │                                               │
-         │  rewrite_query ────────────────────► "Airflow DAG     │
-         │       │                              Cloud SQL timeout"│
-         │       ▼                                               │
-         │  retrieve_documents ───────────► top-3 chunks from    │
-         │       │                          gcp.md, gcp.txt       │
-         │       ▼                                               │
-         │  grade_documents ──────────────────────────► "yes"    │
-         │       │                                               │
-         │  generate_answer ──► builds prompt only               │
-         └──────────────────────────────────────────────────────┘
-                 │
-                 ▼ SSE streams to Streamlit (Two-Phase)
-                 │  Phase 1 (Trace):
-                 │  data: {"trace_step": "classify_and_plan → technical, specific"}
-                 │  data: {"trace_step": "retrieve_documents → ..."}
-                 │  Phase 2 (Tokens):
-                 │  data: {"token": "Check"}
-                 │  data: {"token": " if Cloud SQL"}
-                 │  data: {"done": true, "answer": "Check if Cloud SQL..."}
-                 │
-                 ▼ Streamlit renders:
-                    ✅ classify_and_plan → technical, specific → proceeding to RAG
-                    ✅ rewrite_query → 'Airflow DAG Cloud SQL timeout'
-                    ✅ retrieve_documents → 3 source(s) ['gcp.md', 'gcp.txt']
-                    ✅ grade_documents → docs relevant: yes
-                    ✅ generate_answer → streaming answer... 🔄
-
-                   [Answer displayed]
-                   📎 Sources: gcp.md, gcp.txt
-```
-
----
-
-## 🏗️ Project Structure
+## 📁 Project Directory Structure
 
 ```
 technical-assistant/
-├── app.py              # Streamlit frontend — chat UI, live trace panel, file upload
-├── main.py             # FastAPI backend — REST + SSE endpoints, Pydantic models
-├── rag_pipeline.py     # Core agentic RAG engine (LangGraph graph, all 9 nodes)
-├── inspect_db.py       # Utility to inspect ChromaDB chunk count and run test queries
-├── pyproject.toml      # Dependencies managed by uv
-├── .env                # Secrets: AWS credentials, TAVILY_API_KEY (not committed)
-├── chroma_db/          # ChromaDB persistent vector storage (auto-created)
+├── app.py              # Streamlit Web UI (Chat layout, streaming handler, KB management)
+├── main.py             # FastAPI REST Server (Asynchronous SSE & HTTP endpoints)
+├── rag_pipeline.py     # Core LangGraph pipeline, node logic, and vector store operations
+├── inspect_db.py       # Developer utility for querying & auditing ChromaDB collections
+├── pyproject.toml      # Dependency & package configuration (managed via uv)
+├── .env                # Environment variables (AWS Bedrock region, Tavily API keys)
+├── chroma_db/          # Persistent local ChromaDB database directory
 └── data/
-    ├── docs/           # Technical documentation (.md)
-    ├── faqs/           # FAQ files (.md)
-    └── chats/          # Team chat history exports (.txt)
+    ├── docs/           # Technical product documentation (.md)
+    ├── faqs/           # Product FAQ reference files (.md)
+    └── chats/          # Slack/Teams raw incident chat logs (.txt)
 ```
 
 ---
 
-## 🛠️ Tech Stack
+## 🛠️ Tech Stack & Justification
 
-| Component | Technology | Why |
-|-----------|------------|-----|
-| **LLM** | Claude Haiku via AWS Bedrock | Fast, cheap, smart enough for classification + generation |
-| **Agentic Orchestration** | LangGraph | Conditional routing, stateful nodes, multi-turn memory |
-| **Vector Store** | ChromaDB | Local, zero-config, semantic similarity search |
-| **Embeddings** | `all-MiniLM-L6-v2` (HuggingFace) | Small, fast, high-quality, free |
-| **Web Search** | Tavily API | LLM-optimized search, clean results, no rate limiting |
-| **Backend** | FastAPI | Async, SSE streaming, automatic Swagger docs |
-| **Frontend** | Streamlit | Rapid UI, native chat components, SSE consumption |
-| **Memory** | LangGraph MemorySaver | In-memory per-session conversation history |
-| **Package Manager** | uv | Fast Python package management |
+| Technology | Selection Rationale | Production Alternatives Considered |
+|---|---|---|
+| **LangGraph** | Provides explicit state graphs, conditional branching, and checkpoint persistence required for agentic loops. | **LangChain LCEL** (No state graphs), **CrewAI** (Heavy multi-agent overhead). |
+| **AWS Bedrock (Claude Haiku)** | Enterprise security, high throughput, low latency (~300ms per call), low cost. | **OpenAI Direct API** (Data privacy limits), **Local Llama-3** (Infra overhead). |
+| **ChromaDB** | Embedded, zero-config vector store with native metadata filtering and persistence. | **Pinecone** (SaaS lock-in & cost), **Milvus** (Overkill for single-node deployment). |
+| **HuggingFace Embeddings** (`all-MiniLM-L6-v2`) | High semantic accuracy (384-dim), fast CPU inference, $0 operational cost. | **OpenAI text-embedding-3** (Network latency + per-token charge). |
+| **FastAPI** | Native `async` support, SSE stream response capabilities, automatic Pydantic schema validation. | **Flask** (Synchronous, lacks native SSE stream handling). |
+| **Streamlit** | Rapid Python-native UI prototyping with native chat UI components and reactive session state. | **React / Next.js** (High frontend development overhead). |
+| **Tavily AI Search** | Tailored specifically for LLM search agents; returns clean pre-parsed content snippets. | **DuckDuckGo** (Frequent rate limits), **Google Custom Search** (High cost). |
 
 ---
 
-## 📋 Prerequisites
+## ⚡ End-to-End Execution Flow
 
+### 1. Two-Phase SSE Streaming Request Cycle
+When a user submits a question in Streamlit:
+1. **HTTP Connection:** Streamlit issues a `POST` request to `/chat/stream` with `session_id` and `question`.
+2. **Phase 1 — Graph Event Streaming:** As LangGraph executes nodes (`classify_and_plan` → `rewrite_query` → `retrieve_documents` → `grade_documents`), FastAPI streams trace events immediately to Streamlit, rendering live progress updates inside an `st.status()` container.
+3. **Phase 2 — Token Streaming:** When `generate_answer` completes, `stream_chat_response()` invokes `llm.stream(answer_prompt)` and yields tokens directly to Streamlit, which updates a live markdown text placeholder token-by-token.
+
+---
+
+## 📥 Knowledge Ingestion Engine
+
+The system supports 3 distinct ingestion modes:
+1. **Technical Documentation (`ingest_documentation`):** Uses `RecursiveCharacterTextSplitter` (chunk size: 500, overlap: 50) and tags vectors with `source_type="documentation"`.
+2. **Product FAQs (`ingest_faqs`):** Splitted and indexed with metadata `source_type="faq"`.
+3. **Raw Team Chat Logs (`ingest_chats`):** Pre-processed via LLM structured extraction to transform noisy incident conversations into structured `Question:` and `Verified Answer:` pairs prior to vector indexing.
+
+---
+
+## 🔌 API Reference
+
+### POST `/chat/stream`
+Processes a message through the LangGraph engine and streams execution state and tokens using Server-Sent Events (SSE).
+
+**Request Body:**
+```json
+{
+  "session_id": "user_session_123",
+  "question": "How do I configure the timeout for GCP Cloud SQL?"
+}
+```
+
+**SSE Event Response Format:**
+```http
+data: {"trace_step": "classify_and_plan → technical, specific", "token": "", "done": false}
+data: {"trace_step": "rewrite_query → 'GCP Cloud SQL timeout configuration'", "token": "", "done": false}
+data: {"trace_step": "retrieve_documents → 2 source(s) ['gcp.md']", "token": "", "done": false}
+data: {"trace_step": "generate_answer → streaming answer... 🔄", "token": "", "done": false}
+data: {"trace_step": "", "token": "To", "done": false}
+data: {"trace_step": "", "token": " configure", "done": false}
+...
+data: {"trace_step": "", "token": "", "done": true, "answer": "To configure..."}
+```
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/) — fast Python package manager
-- AWS credentials with access to Amazon Bedrock (`ap-south-1` or your region)
-- Tavily API key — free at [tavily.com](https://tavily.com) (1,000 searches/month)
+- `uv` package manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- AWS Account configured with Bedrock access (`ap-south-1` recommended)
+- Tavily Search API key
+
+### Installation & Environment Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/your-username/technical-assistant.git
+   cd technical-assistant
+   ```
+
+2. **Configure Environment Variables:**
+   Create a `.env` file in the root directory:
+   ```env
+   AWS_DEFAULT_REGION=ap-south-1
+   AWS_ACCESS_KEY_ID=your_aws_access_key
+   AWS_SECRET_ACCESS_KEY=your_aws_secret_key
+   TAVILY_API_KEY=tvly-your_tavily_key
+   ```
+
+3. **Install Dependencies:**
+   ```bash
+   uv sync
+   ```
+
+4. **Launch Application Servers:**
+   - **Backend API Server (FastAPI):**
+     ```bash
+     uv run uvicorn main:app --reload --port 8000
+     ```
+   - **Frontend UI Server (Streamlit):**
+     ```bash
+     uv run streamlit run app.py
+     ```
 
 ---
 
-## 🚀 Setup
+## 🛣️ Future Engineering Roadmap
 
-### 1. Clone the repository
-
-```bash
-git clone <your-repo-url>
-cd technical-assistant
-```
-
-### 2. Install dependencies
-
-```bash
-uv sync
-```
-
-### 3. Configure environment variables
-
-Create a `.env` file in the project root:
-
-```env
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_DEFAULT_REGION=ap-south-1
-
-TAVILY_API_KEY=your_tavily_key
-```
-
----
-
-## ▶️ Running the Application
-
-You need **two terminal windows**.
-
-### Terminal 1 — FastAPI Backend
-
-```bash
-uv run uvicorn main:app --reload --port 8000
-```
-
-API available at: `http://127.0.0.1:8000`
-Swagger docs at: `http://127.0.0.1:8000/docs`
-
-### Terminal 2 — Streamlit Frontend
-
-```bash
-uv run streamlit run app.py
-```
-
-UI opens at: `http://localhost:8501`
-
-> **Always start the FastAPI backend before Streamlit.**
-
----
-
-## 📂 Populating the Knowledge Base
-
-Use the **"📂 Update Knowledge Base"** page in the Streamlit sidebar:
-
-| Category | Format | What happens |
-|----------|--------|-------------|
-| **Documentation** | `.md` | Split into chunks → embedded → stored in ChromaDB |
-| **FAQs** | `.md` | Same as documentation |
-| **Chat History** | Any text | LLM reads the full chat → extracts only technical Q&A pairs → stored as a single curated document |
+- [ ] **SQL Checkpointer Migration:** Replace `MemorySaver` with `SqliteSaver` / `PostgresSaver` for cross-session persistent storage.
+- [ ] **Self-Reflection & Hallucination Guard:** Integrate an additional node to verify answer consistency against context before output rendering.
+- [ ] **Hybrid Search:** Combine ChromaDB dense vector search with sparse BM25 keyword matching using Reciprocal Rank Fusion (RRF).
+- [ ] **Human-in-the-Loop Approval:** Add LangGraph `interrupt` hooks for high-risk system commands or ticket creations.
+M reads the full chat → extracts only technical Q&A pairs → stored as a single curated document |
 
 ---
 

@@ -155,11 +155,13 @@ Conversation History:
 User Message: {question}
 
 Instructions:
-1. Set query_type to "greeting" for: casual talk, hello, hi, how are you, thanks, bye, personal introductions, or any non-technical conversation.
-   Set query_type to "technical" for: any engineering, infrastructure, DevOps, debugging, documentation, or product knowledge question.
+1. Set query_type to "greeting" ONLY for standard salutations, small talk, or sign-offs (e.g. "hi", "hello", "thanks", "bye", "good morning").
+   Set query_type to "technical" for:
+   - Any engineering, infrastructure, DevOps, debugging, documentation, or product knowledge question.
+   - Any question about conversation history, previous questions, user details, memory, or past context (e.g., "tell me about our conversation history", "what did I ask earlier?", "what is my name?").
 
 2. If query_type is "technical": set needs_clarification=true ONLY if it is truly impossible to search — e.g. user says "fix it" or "the error" with ZERO context and chat history provides none either.
-   IMPORTANT: Broad questions like "tell me about the product", "what are common challenges", "retrieve FAQs", "what do we use X for" are NOT vague. Always set needs_clarification=false for these.
+   IMPORTANT: Questions about conversation history, memory, user details, or broad queries like "tell me about the product" are NOT vague. Always set needs_clarification=false for these.
 
 3. If needs_clarification=true: set clarification_question to one short, specific question."""
 
@@ -179,30 +181,37 @@ Instructions:
     }
 
 
-# --- Node 2: Handle greeting (zero LLM cost — pre-canned responses) ---
+# --- Node 2: Handle greeting ---
 def handle_greeting(state: GraphState) -> GraphState:
-    question = state["question"].lower()
+    question = state["question"]
+    messages = state.get("messages", [])[-20:]
 
-    if "thank" in question:
-        responses = [
-            "You're very welcome! Let me know if you need help with anything else.",
-            "No problem at all! Any other technical issues I can look into?",
-            "Happy to help! What's next?"
-        ]
-    elif "bye" in question or "see ya" in question or "goodbye" in question:
-        responses = [
-            "Goodbye! Have a great day.",
-            "Catch you later! Let me know when you need help again.",
-            "Bye! I'll be here if anything breaks."
-        ]
-    else:
+    # Fast path: basic single phrase greetings with no conversation history
+    if not messages and _SIMPLE_GREETINGS.match(question.strip()):
         responses = [
             "Hello! I'm your engineering assistant. What technical challenge are we tackling today?",
             "Hi there! How can I help you with our infrastructure or systems today?",
             "Hey! Ready to troubleshoot or search some docs? Let me know what you need."
         ]
+        answer = random.choice(responses)
+    else:
+        history_text = "\n".join(
+            [f"{msg['role'].capitalize()}: {msg['content']}" for msg in messages]
+        ) if messages else "No prior conversation."
 
-    answer = random.choice(responses)
+        greeting_prompt = f"""You are a friendly engineering assistant.
+The user sent a greeting or casual message. Respond warmly, concisely, and naturally.
+If they shared their name, role, or context in history, address them personally!
+
+Conversation History:
+{history_text}
+
+User Message: {question}
+Response:"""
+
+        response = llm.invoke(greeting_prompt)
+        answer = response.content.strip()
+
     return {
         "answer": answer,
         "messages": [
