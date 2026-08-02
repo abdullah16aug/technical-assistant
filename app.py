@@ -1,24 +1,21 @@
 import os
+import json
 import tempfile
 import streamlit as st
 import requests
 import uuid
 
-# --- Page Configuration ---
 st.set_page_config(page_title="Engineering Assistant", page_icon="🤖", layout="centered")
 
-# --- Session Initialization ---
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- Sidebar Navigation Pane ---
 st.sidebar.title("⚙️ Control Panel")
 st.sidebar.markdown("---")
 
-# Navigation Options
 page = st.sidebar.radio(
     "Select a View:",
     ["💬 Chat Assistant", "📂 Update Knowledge Base"]
@@ -26,52 +23,77 @@ page = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 
-# --- Page 1: Chat Assistant View ---
+# --- Page 1: Chat Assistant ---
 if page == "💬 Chat Assistant":
     st.title("🤖 Engineering RAG Assistant")
-    st.caption("Your technical support bot powered by FastAPI and ChromaDB.")
+    st.caption("Your technical support bot powered by FastAPI, LangGraph, and ChromaDB.")
 
-    # Render Chat History
+    # Render existing chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message["role"] == "assistant" and message.get("trace"):
+                with st.expander("🔍 Graph Execution Trace", expanded=False):
+                    for step in message["trace"]:
+                        st.markdown(f"✅ `{step}`")
 
-    # Chat Input Box
     user_input = st.chat_input("Ask a technical question about the infrastructure...")
 
     if user_input:
         with st.chat_message("user"):
             st.markdown(user_input)
         st.session_state.messages.append({"role": "user", "content": user_input})
-        
+
         with st.chat_message("assistant"):
-            with st.spinner("Searching documentation and thinking..."):
-                try:
-                    response = requests.post(
-                        "http://127.0.0.1:8000/chat",
+            try:
+                bot_answer = ""
+                current_trace = []
+                answer_placeholder = st.empty()
+
+                # Live streaming trace panel using st.status
+                with st.status("🔍 Analyzing your question...", expanded=True) as status:
+                    with requests.post(
+                        "http://127.0.0.1:8000/chat/stream",
                         json={
                             "session_id": st.session_state.session_id,
-                            "question": user_input
-                        }
-                    )
-                    response.raise_for_status()
-                    bot_answer = response.json().get("answer", "No answer found.")
-                    st.markdown(bot_answer)
-                    st.session_state.messages.append({"role": "assistant", "content": bot_answer})
-                    
-                except requests.exceptions.ConnectionError:
-                    st.error("Error: Could not connect to the backend. Is your FastAPI server running on port 8000?")
-                except Exception as e:
-                    st.error(f"An error occurred: {str(e)}")
+                            "question": user_input,
+                        },
+                        stream=True,
+                        timeout=120,
+                    ) as response:
+                        response.raise_for_status()
+                        for line in response.iter_lines():
+                            if line and line.startswith(b"data: "):
+                                data = json.loads(line[6:].decode())
+                                if data.get("trace_step"):
+                                    st.write(f"✅ {data['trace_step']}")
+                                    current_trace.append(data["trace_step"])
+                                if data.get("done"):
+                                    bot_answer = data["answer"]
+                                    break
 
-# --- Page 2: Update Knowledge Base View ---
+                    status.update(label="✅ Done", state="complete", expanded=False)
+
+                answer_placeholder.markdown(bot_answer)
+
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": bot_answer,
+                    "trace": current_trace,
+                })
+
+            except requests.exceptions.ConnectionError:
+                st.error("Error: Could not connect to the backend. Is your FastAPI server running on port 8000?")
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+
+# --- Page 2: Update Knowledge Base ---
 elif page == "📂 Update Knowledge Base":
     st.title("📂 Update System Knowledge Base")
     st.markdown("Add new technical materials, structured FAQs, or past team chat logs to the vector database.")
 
     allowed_md_types = {"Documentation", "FAQs"}
 
-    # Form components for ingestion inputs
     with st.form("ingestion_form"):
         uploaded_file = st.file_uploader(
             "Upload a file:",
@@ -79,12 +101,10 @@ elif page == "📂 Update Knowledge Base":
             accept_multiple_files=False,
             help="Drag and drop a file here, or click to browse. Documentation and FAQ files must be .md."
         )
-        
         data_type = st.selectbox(
             "Select Data Category:",
             ["Documentation", "FAQs", "Chat History"]
         )
-        
         submit_button = st.form_submit_button(label="🚀 Upload and Ingest")
 
     if submit_button:
@@ -115,7 +135,6 @@ elif page == "📂 Update Knowledge Base":
                                 "original_filename": file_name,
                             }
                         )
-
                         response.raise_for_status()
                         res_data = response.json()
 
