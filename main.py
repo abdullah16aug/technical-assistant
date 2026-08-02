@@ -21,7 +21,7 @@ class ChatResponse(BaseModel):
 
 class IngestionRequest(BaseModel):
     file_path: str
-
+    original_filename: Optional[str] = None
 class IngestionResponse(BaseModel):
     status: str
     message: str
@@ -39,7 +39,7 @@ async def chat_endpoint(request: ChatRequest):
 @app.post("/ingest/documentation", response_model=IngestionResponse)
 async def api_ingest_documentation(request: IngestionRequest):
     try:
-        result = rag_pipeline.ingest_documentation(request.file_path)
+        result = rag_pipeline.ingest_documentation(request.file_path,request.original_filename)
         return IngestionResponse(status="success", message=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -47,7 +47,7 @@ async def api_ingest_documentation(request: IngestionRequest):
 @app.post("/ingest/faq", response_model=IngestionResponse)
 async def api_ingest_faq(request: IngestionRequest):
     try:
-        result = rag_pipeline.ingest_faqs(request.file_path)
+        result = rag_pipeline.ingest_faqs(request.file_path,request.original_filename)
         return IngestionResponse(status="success", message=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -56,7 +56,7 @@ async def api_ingest_faq(request: IngestionRequest):
 async def api_ingest_chats(request: IngestionRequest):
     try:
         # result ab ek dictionary hai: {"message": "...", "extracted_data": "..."}
-        result = rag_pipeline.ingest_chats(request.file_path)
+        result = rag_pipeline.ingest_chats(request.file_path,request.original_filename)
         
         # Hum dictionary se values nikal kar response model mein match kar rahe hain
         return IngestionResponse(

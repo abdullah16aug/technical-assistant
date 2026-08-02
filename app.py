@@ -110,8 +110,12 @@ elif page == "📂 Update Knowledge Base":
                     with st.spinner(f"Ingesting uploaded {file_name} into {data_type}..."):
                         response = requests.post(
                             target_url,
-                            json={"file_path": tmp_file_path}
+                            json={
+                                "file_path": tmp_file_path,
+                                "original_filename": file_name,
+                            }
                         )
+
                         response.raise_for_status()
                         res_data = response.json()
 

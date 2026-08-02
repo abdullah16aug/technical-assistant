@@ -1,8 +1,0 @@
-[2026-07-18 10:00:00] [dev_sarah]: Morning everyone! How was the weekend?
-[2026-07-18 10:05:00] [ops_mike]: Pretty good, went hiking. Hey, is anyone else seeing the Jenkins build fail on the main branch?
-[2026-07-18 10:07:00] [dev_sarah]: Yeah, I just got an email about it. Error says "Out of memory" during the npm install step.
-[2026-07-18 10:15:00] [ops_mike]: Let me look at the node worker nodes. Ah, they are capped at 2GB RAM.
-[2026-07-18 10:18:00] [dev_sarah]: How do we fix that? Can we bump it up?
-[2026-07-18 10:20:00] [ops_mike]: Yes, I'm updating the Kubernetes deployment file for the Jenkins workers. Setting the memory limit to 4GB. You just need to change `resources.limits.memory` to `4Gi` in `jenkins-worker.yaml`.
-[2026-07-18 10:25:00] [dev_sarah]: Awesome, I'll trigger a rebuild once you commit that.
-[2026-07-18 10:30:00] [ops_mike]: Committed and pushed. Build is green now!
