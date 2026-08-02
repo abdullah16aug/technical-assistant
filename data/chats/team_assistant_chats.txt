@@ -1,0 +1,29 @@
+[2026-08-01 10:15:00] [sarah_dev]: 
+Hey team, I'm trying to upload a 25MB PDF manual to TeamAssistant but it keeps failing. Any ideas?
+
+[2026-08-01 10:17:00] [admin_mike]: 
+Ah, the maximum upload size is currently capped at 20 MB per file. You'll need to split that PDF into two smaller files and upload them separately.
+
+[2026-08-01 10:18:30] [sarah_dev]: 
+Got it, that worked. Thanks! Also, I noticed some flowcharts in the PDF aren't showing up in the search results.
+
+[2026-08-01 10:20:00] [admin_mike]: 
+Yeah, TeamAssistant currently doesn't index images or diagrams. If there's text inside those flowcharts, they need to be passed through an OCR tool before uploading so the text can be extracted and embedded.
+
+[2026-08-01 14:05:00] [john_data]: 
+Quick question — what embedding model are we using under the hood for TeamAssistant?
+
+[2026-08-01 14:10:00] [admin_mike]: 
+We are using Amazon Titan Text Embeddings. For the actual generation model, we're using Claude via AWS Bedrock.
+
+[2026-08-01 16:30:00] [lisa_pm]: 
+I want to give our new intern access to TeamAssistant. What role should I request for them?
+
+[2026-08-01 16:35:00] [admin_mike]: 
+Request the "Viewer" role in Microsoft Entra ID. That will give them read-only access to ask questions, but they won't be able to upload or delete documents.
+
+[2026-08-02 09:15:00] [dev_team_lead]:
+We're getting a lot of complaints that the Web Search Fallback isn't triggering when it should.
+
+[2026-08-02 09:20:00] [admin_mike]:
+I looked into this. Make sure the TAVILY_API_KEY is properly set in the .env file. If the key is missing or the quota is exhausted, the fallback gracefully skips the web search and just tells the user no answer was found.

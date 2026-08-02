@@ -48,9 +48,11 @@ if page == "💬 Chat Assistant":
             try:
                 bot_answer = ""
                 current_trace = []
-                answer_placeholder = st.empty()
+                # Placeholder for progressive token rendering (outside st.status)
+                token_placeholder = st.empty()
+                accumulated_tokens = ""
 
-                # Live streaming trace panel using st.status
+                # Phase 1: Live trace panel
                 with st.status("🔍 Analyzing your question...", expanded=True) as status:
                     with requests.post(
                         "http://127.0.0.1:8000/chat/stream",
@@ -65,16 +67,28 @@ if page == "💬 Chat Assistant":
                         for line in response.iter_lines():
                             if line and line.startswith(b"data: "):
                                 data = json.loads(line[6:].decode())
+
+                                # Trace labels (Phase 1)
                                 if data.get("trace_step"):
                                     st.write(f"✅ {data['trace_step']}")
                                     current_trace.append(data["trace_step"])
+
+                                # Token streaming (Phase 2) — render outside status panel
+                                if data.get("token"):
+                                    accumulated_tokens += data["token"]
+                                    token_placeholder.markdown(accumulated_tokens + "▌")
+
                                 if data.get("done"):
                                     bot_answer = data["answer"]
+                                    # Final clean render — remove cursor
+                                    token_placeholder.markdown(bot_answer)
                                     break
 
                     status.update(label="✅ Done", state="complete", expanded=False)
 
-                answer_placeholder.markdown(bot_answer)
+                # For non-streaming paths (greeting, web search) render answer now
+                if not accumulated_tokens and bot_answer:
+                    token_placeholder.markdown(bot_answer)
 
                 st.session_state.messages.append({
                     "role": "assistant",

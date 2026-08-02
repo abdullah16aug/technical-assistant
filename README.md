@@ -1,6 +1,6 @@
-# 🤖 Engineering RAG Assistant
+# 🤖 TeamAssistant — Agentic RAG Bot
 
-An **Agentic RAG (Retrieval-Augmented Generation)** chatbot for engineering teams. It answers technical questions from your team's internal documentation, FAQs, and past chat logs — and falls back to live web search when the knowledge base doesn't have the answer. Built with **LangGraph**, **FastAPI**, **Streamlit**, **ChromaDB**, and **Amazon Bedrock**.
+An **Agentic RAG (Retrieval-Augmented Generation)** knowledge assistant for engineering teams, acting as the backend for the **TeamAssistant** product. It answers technical questions by retrieving context from internal documentation, FAQs, and Microsoft Teams chat logs — and falls back to live web search when the internal knowledge base doesn't have the answer. Built with **LangGraph**, **FastAPI**, **Streamlit**, **ChromaDB**, and **Amazon Bedrock**.
 
 ---
 
@@ -12,28 +12,19 @@ This is not a simple Q&A bot. It is a **multi-node agentic system** where every 
 User Question
       │
       ▼
-┌─────────────────┐
-│   route_query   │  ← LLM classifies: "greeting" or "technical"
-└────────┬────────┘
+┌─────────────────────┐
+│  classify_and_plan  │  ← LLM classifies intent + checks ambiguity (Structured Output)
+└────────┬────────────┘
          │
-    ┌────┴──────┐
-    ▼            ▼
-greeting      technical
-    │            │
-    ▼            ▼
-┌──────────┐  ┌─────────┐
-│ handle_  │  │ planner │  ← Is the question specific enough to search?
-│ greeting │  └────┬────┘
-└────┬─────┘       │
-     │         ┌───┴────────────┐
-     │         ▼                ▼
-     │    too vague          specific
-     │         │                │
-     │         ▼                ▼
-     │  ┌──────────────┐  ┌──────────────┐
-     │  │ask_clarific- │  │rewrite_query │  ← Contextualizes with chat history
-     │  │ation         │  └──────┬───────┘
-     │  └──────┬───────┘         ▼
+    ┌────┼──────────────┐
+    ▼    ▼              ▼
+greeting technical    technical
+    │  (vague)       (specific)
+    ▼    │              │
+┌────────┴──┐  ┌────────┴─────┐
+│  handle_  │  │ask_clarific- │  │rewrite_query │  ← Contextualizes with chat history
+│  greeting │  │ation         │  └──────┬───────┘
+└────┬──────┘  └──────┬───────┘         ▼
      │         │          ┌──────────────────┐
      │         │          │retrieve_documents │  ← ChromaDB vector similarity search
      │         │          └──────┬───────────┘
@@ -101,34 +92,22 @@ LangGraph merges state updates using reducer functions. Without `operator.add`, 
 
 ---
 
-### 3. Node: `route_query` — The Gatekeeper
+### 3. Node: `classify_and_plan` — Intent & Ambiguity Detector
 
-**What it does:** Sends the question to Claude Haiku and asks it to classify as `"greeting"` or `"technical"` in one word.
+**What it does:** Uses `llm.with_structured_output(PydanticModel)` to classify the query as `"greeting"` or `"technical"`, and simultaneously decides if the question is specific enough to search or too vague. It returns guaranteed typed output — zero fragile string parsing.
 
-**Why this matters:** Without this, every "hi" or "thanks" would trigger a full RAG pipeline — wasting vector DB calls and making responses feel robotic.
-
-**What happens after:**
-- `greeting` → `handle_greeting` (casual, warm response, no DB hit)
-- `technical` → `planner`
-
----
-
-### 4. Node: `planner` — Ambiguity Detector
-
-**What it does:** Reads the question + last 20 messages of conversation history and decides if the question is **specific enough to search**, or too vague to be useful.
+**Why this matters:** 
+- Previously, this took two separate Bedrock round-trips. Now it happens in a single LLM call, saving ~700ms of latency per message.
+- A simple greeting regex intercepts `"hi"` or `"thanks"` before hitting the LLM at all, costing zero compute.
 
 **Example of what it catches:**
 - ❌ `"pipeline is failing"` → vague (which pipeline? Airflow? Spark? Dataflow?)
 - ✅ `"Airflow DAG failing with Cloud SQL connection timeout"` → specific
 
-**Why this matters:** Without a planner, a vague question like "how do I fix it?" would retrieve random docs and generate a hallucinated or irrelevant answer. The planner catches this early and asks the user to clarify.
-
-**Multi-turn awareness:** Because the planner reads `messages` (conversation history), if a user first said "Airflow" and then asks "what's the retry config?", the planner sees the context and marks it as specific — no re-asking.
-
-**Alternatives:**
-- Rule-based keyword detection (fragile, doesn't understand context)
-- Always ask for clarification (annoying UX)
-- Skip it entirely (random bad answers)
+**What happens after:**
+- `greeting` → `handle_greeting` (casual, warm response, no DB hit)
+- `technical (vague)` → `ask_clarification` (stops graph and asks user)
+- `technical (specific)` → `rewrite_query` (proceeds to RAG)
 
 ---
 
@@ -190,7 +169,9 @@ LangGraph merges state updates using reducer functions. Without `operator.add`, 
 
 ### 8. Node: `grade_documents` — The Relevance Gatekeeper
 
-**What it does:** After retrieving 3 chunks from ChromaDB, sends them to Claude Haiku with a prompt asking: "Are these documents relevant to the question? Answer yes or no."
+**What it does:** Uses `llm.with_structured_output(PydanticModel)` to ask: "Are these documents relevant to the question?" Returns a reliable boolean `relevant: True/False`.
+
+**Fast Heuristic:** If the retrieved context is empty or < 50 characters, it skips the LLM grader entirely and immediately routes to web search, saving an LLM call.
 
 **Why this matters (prevents hallucination):**
 - Without a grader, the LLM receives irrelevant chunks and tries to answer anyway — making up plausible-sounding but wrong answers.
@@ -269,14 +250,14 @@ LangGraph merges state updates using reducer functions. Without `operator.add`, 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/chat` | Non-streaming: returns full `{answer, trace}` JSON |
-| `POST` | `/chat/stream` | **SSE streaming**: yields trace steps live as graph executes |
+| `POST` | `/chat/stream` | **Two-phase SSE streaming**: yields trace steps live, then streams tokens |
 | `POST` | `/ingest/documentation` | Ingest a `.md` documentation file |
 | `POST` | `/ingest/faq` | Ingest a `.md` FAQ file |
 | `POST` | `/ingest/chats` | Ingest chat logs (LLM extracts Q&A pairs) |
 
-**Why we have both `/chat` and `/chat/stream`:**
-- `/chat` returns everything at once after the full graph completes (~5-10 seconds).
-- `/chat/stream` uses **Server-Sent Events (SSE)** — each node completion sends a `data: {...}` event to the client immediately. Streamlit consumes these to build the live trace panel.
+**Two-Phase Streaming via SSE:**
+- **Phase 1 (Trace):** Graph execution traces (e.g. `retrieve_documents → 3 source(s)`) stream instantly as nodes complete.
+- **Phase 2 (Tokens):** Once `generate_answer` builds the prompt, the FastAPI endpoint calls `llm.stream()` and yields the final response word-by-word back to Streamlit, creating a fast, ChatGPT-like live typing effect.
 
 **Why FastAPI and not Flask:**
 - FastAPI has native `async` support, Pydantic validation, and automatic Swagger docs at `/docs`.
@@ -319,10 +300,8 @@ User types: "Our Airflow DAG failed. Cloud SQL connection timeout."
                 │
          ┌──────────────────────────────────────────────────────┐
          │                  LangGraph Graph                      │
-         │                                                        │
-         │  route_query ──────────────────────────► "technical"  │
-         │       │                                               │
-         │  planner ─────────────────────────────► "specific"    │
+         │                                                       │
+         │  classify_and_plan ────────────────────► "technical", "specific"
          │       │                                               │
          │  rewrite_query ────────────────────► "Airflow DAG     │
          │       │                              Cloud SQL timeout"│
@@ -332,22 +311,24 @@ User types: "Our Airflow DAG failed. Cloud SQL connection timeout."
          │       ▼                                               │
          │  grade_documents ──────────────────────────► "yes"    │
          │       │                                               │
-         │  generate_answer ──► LLM + context + history → answer │
+         │  generate_answer ──► builds prompt only               │
          └──────────────────────────────────────────────────────┘
-                │
-                ▼ SSE events stream to Streamlit
-                │  data: {"trace_step": "route_query → technical"}
-                │  data: {"trace_step": "planner → specific"}
-                │  data: {"trace_step": "retrieve_documents → ..."}
-                │  data: {"done": true, "answer": "Check if Cloud SQL Proxy..."}
-                │
-                ▼ Streamlit renders:
-                   ✅ route_query → technical
-                   ✅ planner → specific, proceeding to RAG
-                   ✅ rewrite_query → 'Airflow DAG Cloud SQL timeout'
-                   ✅ retrieve_documents → 3 source(s) ['gcp.md', 'gcp.txt']
-                   ✅ grade_documents → docs relevant: yes
-                   ✅ generate_answer → answered from knowledge base ✅
+                 │
+                 ▼ SSE streams to Streamlit (Two-Phase)
+                 │  Phase 1 (Trace):
+                 │  data: {"trace_step": "classify_and_plan → technical, specific"}
+                 │  data: {"trace_step": "retrieve_documents → ..."}
+                 │  Phase 2 (Tokens):
+                 │  data: {"token": "Check"}
+                 │  data: {"token": " if Cloud SQL"}
+                 │  data: {"done": true, "answer": "Check if Cloud SQL..."}
+                 │
+                 ▼ Streamlit renders:
+                    ✅ classify_and_plan → technical, specific → proceeding to RAG
+                    ✅ rewrite_query → 'Airflow DAG Cloud SQL timeout'
+                    ✅ retrieve_documents → 3 source(s) ['gcp.md', 'gcp.txt']
+                    ✅ grade_documents → docs relevant: yes
+                    ✅ generate_answer → streaming answer... 🔄
 
                    [Answer displayed]
                    📎 Sources: gcp.md, gcp.txt
